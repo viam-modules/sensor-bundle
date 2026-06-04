@@ -1,0 +1,138 @@
+name: Deploy Module
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'DEVELOPER_GUIDE.md'
+      - 'docs/**'
+      - '**/*.md'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag (e.g. v0.0.21)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  compute-version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      # actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Bump rc tag
+        id: bump
+        if: github.event_name == 'push'
+        # mathieudutour/github-tag-action@v6.2
+        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Release tags come from the release event; main pushes only produce rc tags.
+          release_branches: __none__
+          pre_release_branches: main
+          append_to_pre_release_tag: rc
+          default_bump: patch
+
+      - name: Resolve version
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUMP_TAG: ${{ steps.bump.outputs.new_tag }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            VERSION="$BUMP_TAG"
+          else
+            VERSION="${INPUT_VERSION:-$REF_NAME}"
+          fi
+          echo "Resolved version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  publish-module:
+    needs: [compute-version]
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Build and upload to Viam Registry
+        # viamrobotics/build-action@v1.7.2
+        uses: viamrobotics/build-action@68c0a3cef8247f2324a6de7107b09fa9e9ef8b49
+        with:
+          version: ${{ needs.compute-version.outputs.version }}
+          ref: ${{ github.sha }}
+          key-id: ${{ secrets.viam_key_id }}
+          key-value: ${{ secrets.viam_key_secret }}
+          token: ${{ github.token }}
+
+  send-slack-msg:
+    name: Send Slack Message
+    needs: [compute-version, publish-module]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Generate metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          VERSION: ${{ needs.compute-version.outputs.version }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          MODULE_RESULT: ${{ needs.publish-module.result }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            KIND="rc build"
+            LINK_URL="${SERVER_URL}/${REPOSITORY}/commit/${SHA}"
+            LINK_LABEL="commit ${SHA:0:7}"
+          else
+            KIND="release"
+            LINK_URL="${SERVER_URL}/${REPOSITORY}/releases/tag/${VERSION}"
+            LINK_LABEL="Release ${VERSION}"
+          fi
+          if [ "$MODULE_RESULT" = "success" ]; then
+            RESULT="success"
+          else
+            RESULT="failure"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "kind=$KIND"
+            echo "link_url=$LINK_URL"
+            echo "link_label=$LINK_LABEL"
+            echo "result=$RESULT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send slack message
+        # slackapi/slack-github-action@v2.1.1
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+              "text": "Deploy ${{ steps.meta.outputs.version }} (${{ steps.meta.outputs.kind }}) ${{ steps.meta.outputs.result == 'success' && '*succeeded* :white_check_mark:' || '*failed* :x:'}}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.meta.outputs.result == 'success' && format('Deploy *{0}* ({1}) *succeeded* :white_check_mark:\n\t<{2}|{3}>', steps.meta.outputs.version, steps.meta.outputs.kind, steps.meta.outputs.link_url, steps.meta.outputs.link_label) || format('Deploy *{0}* ({1}) *failed* :x:\n\t<{2}|{3}>', steps.meta.outputs.version, steps.meta.outputs.kind, steps.meta.outputs.link_url, steps.meta.outputs.link_label) }}\n\tModule: ${{ needs.publish-module.result }}\n\t<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run>"
+                  }
+                }
+              ]
+            }

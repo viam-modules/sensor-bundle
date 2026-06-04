@@ -1,0 +1,13 @@
+{
+  "module_name": "sensor-bundle",
+  "visibility": "public",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "component",
+  "resource_subtype": "sensor",
+  "model_name": "stateful-sensor",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-06-04T14:59:28.069826Z",
+  "module_readme_link": "README.md"
+}

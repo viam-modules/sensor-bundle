@@ -1,0 +1,27 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam:sensor-bundle",
+  "visibility": "public",
+  "url": "https://github.com/viam-modules/sensor-bundle",
+  "description": "Sensor bundle module: stateful-sensor",
+  "models": [
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam:sensor-bundle:stateful-sensor",
+      "short_description": "Sensor that holds a value set via DoCommand, serves it through Readings, and persists it to a file.",
+      "markdown_link": "README.md#model-viamsensor-bundlestateful-sensor"
+    }
+  ],
+  "entrypoint": "bin/sensor-bundle",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}
