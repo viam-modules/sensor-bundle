@@ -140,10 +140,10 @@ func (s *sensorBundleStatefulSensor) saveToFile() error {
 		return fmt.Errorf("failed to create temp state file in %q: %w", dir, err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op if the rename succeeded
+	defer func() { _ = os.Remove(tmpName) }() // no-op if the rename succeeded
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("failed to write temp state file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
