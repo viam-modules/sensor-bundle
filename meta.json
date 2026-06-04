@@ -14,7 +14,7 @@
     {
       "api": "rdk:component:sensor",
       "model": "viam:sensor-bundle:sensor-monitor",
-      "short_description": "Monitors a sensor's readings against numeric trigger rules and sends notifications via a generic service's DoCommand.",
+      "short_description": "Monitors a sensor's readings against numeric trigger rules and sends notifications.",
       "markdown_link": "README.md#model-viamsensor-bundlesensor-monitor"
     }
   ],
