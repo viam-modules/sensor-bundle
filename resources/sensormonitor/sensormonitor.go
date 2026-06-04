@@ -241,7 +241,8 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) {
 	msg := renderMessage(rule, value)
 	cmd := map[string]interface{}{
-		"post": map[string]interface{}{"text": msg},
+		"command": "send",
+		"text":    msg,
 	}
 	if _, err := m.notifierDep.DoCommand(ctx, cmd); err != nil {
 		m.logger.Errorf("failed to notify via %q: %v", m.cfg.Notifier, err)
