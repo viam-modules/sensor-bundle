@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"sensorbundle"
+	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	sensor "go.viam.com/rdk/components/sensor"
+	"sensorbundle"
 )
 
 func main() {
@@ -28,7 +28,11 @@ func realMain() error {
 	if err != nil {
 		return err
 	}
-	defer thing.Close(ctx)
+	defer func() {
+		if err := thing.Close(ctx); err != nil {
+			logger.Warnf("closing resource: %v", err)
+		}
+	}()
 
 	return nil
 }
