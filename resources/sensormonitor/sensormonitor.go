@@ -53,7 +53,7 @@ type Config struct {
 	// Sensor is the name of the sensor dependency whose readings are monitored.
 	Sensor string `json:"sensor"`
 	// Notifier is the name of the generic service dependency that receives
-	// notification DoCommands of the form {"post": {"text": <message>}}.
+	// notification DoCommands of the form {"command": "send", "text": <message>}.
 	Notifier string `json:"notifier"`
 	// Rules is the set of numeric trigger rules. At least one is required.
 	Rules []Rule `json:"rules"`
@@ -126,6 +126,21 @@ func newSensorMonitor(ctx context.Context, deps resource.Dependencies, rawConf r
 
 // New builds a sensor-monitor and starts its background polling loop.
 func New(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
+	m, err := newMonitor(deps, name, conf, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	m.wg.Add(1)
+	go m.run()
+
+	return m, nil
+}
+
+// newMonitor resolves dependencies and builds the monitor WITHOUT starting the
+// background polling loop. New wraps this and starts the loop; tests use it to
+// drive poll deterministically.
+func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (*sensorMonitor, error) {
 	sensorDep, err := sensor.FromProvider(deps, conf.Sensor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sensor dependency %q: %w", conf.Sensor, err)
@@ -143,7 +158,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
-	m := &sensorMonitor{
+	return &sensorMonitor{
 		Named:        name.AsNamed(),
 		logger:       logger,
 		cfg:          conf,
@@ -155,12 +170,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		cancelFunc:   cancelFunc,
 		lastReadings: map[string]interface{}{},
 		ruleStates:   make([]ruleState, len(conf.Rules)),
-	}
-
-	m.wg.Add(1)
-	go m.run()
-
-	return m, nil
+	}, nil
 }
 
 // run is the background polling loop. It exits when the resource is closed.

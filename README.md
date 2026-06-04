@@ -74,7 +74,7 @@ Monitors the readings of another sensor and fires notifications when a numeric r
 When a rule fires, the monitor calls `DoCommand` on the notifier with the payload:
 
 ```json
-{"post": {"text": "<notification message>"}}
+{"command": "send", "text": "<notification message>"}
 ```
 
 Notifications are **edge-triggered**: a message is sent when a rule transitions from not-triggered to triggered. While the rule stays triggered no further message is sent, unless `cooldown_seconds` is set, in which case the message repeats at most once per cooldown window. When the reading clears the threshold and crosses it again, a new notification is sent.

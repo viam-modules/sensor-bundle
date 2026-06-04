@@ -73,35 +73,31 @@ func (f *fakeNotifier) texts() []string {
 	defer f.mu.Unlock()
 	out := make([]string, 0, len(f.received))
 	for _, cmd := range f.received {
-		post, ok := cmd["post"].(map[string]interface{})
-		if !ok {
+		if cmd["command"] != "send" {
 			continue
 		}
-		if text, ok := post["text"].(string); ok {
+		if text, ok := cmd["text"].(string); ok {
 			out = append(out, text)
 		}
 	}
 	return out
 }
 
-// newTestMonitor builds a monitor wired to the given fakes. A very large poll
-// interval keeps the background ticker dormant so tests drive poll() directly.
+// newTestMonitor builds a monitor wired to the given fakes WITHOUT starting the
+// background polling loop, so tests drive poll() deterministically.
 func newTestMonitor(t *testing.T, cfg *Config, src *fakeSensor, notifier *fakeNotifier) *sensorMonitor {
 	t.Helper()
-	if cfg.PollIntervalSec == 0 {
-		cfg.PollIntervalSec = 3600
-	}
 	deps := resource.Dependencies{
 		sensor.Named(cfg.Sensor):    src,
 		generic.Named(cfg.Notifier): notifier,
 	}
 	name := resource.NewName(sensor.API, "monitor")
-	s, err := New(context.Background(), deps, name, cfg, logging.NewTestLogger(t))
+	m, err := newMonitor(deps, name, cfg, logging.NewTestLogger(t))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("newMonitor: %v", err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
-	return s.(*sensorMonitor)
+	t.Cleanup(func() { _ = m.Close(context.Background()) })
+	return m
 }
 
 func TestValidate(t *testing.T) {
