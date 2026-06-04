@@ -23,7 +23,7 @@ A stateful sensor that holds an arbitrary value. Set the value with the `set` Do
 
 | Name        | Type   | Required | Description                                                                                                  |
 | ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `file_path` | string | No       | Where the value is persisted. Defaults to `<resource-name>_state.json` in the module's working directory.    |
+| `file_path` | string | No       | Where the value is persisted. Defaults to `<resource-name>_state.json` inside the module's data directory (the writable path Viam provides via `VIAM_MODULE_DATA`), falling back to the working directory when that is unset. |
 
 ### Example Configuration
 

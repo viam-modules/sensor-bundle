@@ -72,6 +72,27 @@ func TestLoadsValueFromFileOnInit(t *testing.T) {
 	}
 }
 
+func TestDefaultPathUsesModuleDataDir(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("VIAM_MODULE_DATA", dataDir)
+
+	// No FilePath configured: the sensor should persist into VIAM_MODULE_DATA.
+	name := resource.NewName(resource.APINamespace("rdk").WithComponentType("sensor"), "usage-sensor")
+	s, err := New(context.Background(), nil, name, &Config{}, logging.NewTestLogger(t))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	want := filepath.Join(dataDir, "usage-sensor_state.json")
+	if got := s.(*statefulSensor).filePath; got != want {
+		t.Fatalf("filePath = %q, want %q", got, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("expected state file in module data dir, got: %v", err)
+	}
+}
+
 func TestDoCommandRejectsUnknownCommand(t *testing.T) {
 	ctx := context.Background()
 	s := newTestSensor(t, filepath.Join(t.TempDir(), "state.json"))
