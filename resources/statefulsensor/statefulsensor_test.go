@@ -1,4 +1,4 @@
-package sensorbundle
+package statefulsensor
 
 import (
 	"context"
@@ -10,15 +10,15 @@ import (
 	"go.viam.com/rdk/resource"
 )
 
-func newTestSensor(t *testing.T, filePath string) *sensorBundleStatefulSensor {
+func newTestSensor(t *testing.T, filePath string) *statefulSensor {
 	t.Helper()
 	name := resource.NewName(resource.APINamespace("rdk").WithComponentType("sensor"), "test")
-	s, err := NewStatefulSensor(context.Background(), nil, name, &Config{FilePath: filePath}, logging.NewTestLogger(t))
+	s, err := New(context.Background(), nil, name, &Config{FilePath: filePath}, logging.NewTestLogger(t))
 	if err != nil {
-		t.Fatalf("NewStatefulSensor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
-	return s.(*sensorBundleStatefulSensor)
+	return s.(*statefulSensor)
 }
 
 func TestCreatesFileWhenMissing(t *testing.T) {

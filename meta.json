@@ -3,13 +3,19 @@
   "module_id": "viam:sensor-bundle",
   "visibility": "public",
   "url": "https://github.com/viam-modules/sensor-bundle",
-  "description": "Sensor bundle module: stateful-sensor",
+  "description": "Sensor bundle module: stateful-sensor, sensor-monitor",
   "models": [
     {
       "api": "rdk:component:sensor",
       "model": "viam:sensor-bundle:stateful-sensor",
       "short_description": "Sensor that holds a value set via DoCommand, serves it through Readings, and persists it to a file.",
       "markdown_link": "README.md#model-viamsensor-bundlestateful-sensor"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam:sensor-bundle:sensor-monitor",
+      "short_description": "Monitors a sensor's readings against numeric trigger rules and sends notifications via a generic service's DoCommand.",
+      "markdown_link": "README.md#model-viamsensor-bundlesensor-monitor"
     }
   ],
   "entrypoint": "bin/sensor-bundle",

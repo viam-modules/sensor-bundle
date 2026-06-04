@@ -5,7 +5,7 @@ import (
 	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	"sensorbundle"
+	"sensorbundle/resources/statefulsensor"
 )
 
 func main() {
@@ -22,9 +22,9 @@ func realMain() error {
 	deps := resource.Dependencies{}
 	// can load these from a remote machine if you need
 
-	cfg := sensorbundle.Config{}
+	cfg := statefulsensor.Config{}
 
-	thing, err := sensorbundle.NewStatefulSensor(ctx, deps, sensor.Named("foo"), &cfg, logger)
+	thing, err := statefulsensor.New(ctx, deps, sensor.Named("foo"), &cfg, logger)
 	if err != nil {
 		return err
 	}

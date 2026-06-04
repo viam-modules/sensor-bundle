@@ -3,6 +3,7 @@
 The `viam:sensor-bundle` module provides these models:
 
 1. **`viam:sensor-bundle:stateful-sensor`** - A sensor component that holds a value you set via `DoCommand`, serves it through the Readings API, and persists it to a file on disk so it survives restarts.
+2. **`viam:sensor-bundle:sensor-monitor`** - A sensor component that watches another sensor's readings against numeric trigger rules and sends a notification via a generic service's `DoCommand` when a threshold is crossed.
 
 ---
 
@@ -60,4 +61,107 @@ Returns:
 
 ```json
 {"set": "ok"}
+```
+
+---
+
+## Model: `viam:sensor-bundle:sensor-monitor`
+
+**API:** `rdk:component:sensor`
+
+Monitors the readings of another sensor and fires notifications when a numeric reading crosses a configured threshold. It takes two dependencies — the sensor to watch and a generic service to notify — and evaluates a set of numeric trigger rules on every poll.
+
+When a rule fires, the monitor calls `DoCommand` on the notifier with the payload:
+
+```json
+{"command": "send", "text": "<notification message>"}
+```
+
+Notifications are **edge-triggered**: a message is sent when a rule transitions from not-triggered to triggered. While the rule stays triggered no further message is sent, unless `cooldown_seconds` is set, in which case the message repeats at most once per cooldown window. When the reading clears the threshold and crosses it again, a new notification is sent.
+
+### Configuration
+
+```json
+{
+  "sensor": "<string>",
+  "notifier": "<string>",
+  "poll_interval_seconds": <number>,
+  "cooldown_seconds": <number>,
+  "rules": [
+    {
+      "key": "<string>",
+      "operator": "<string>",
+      "threshold": <number>,
+      "message": "<string>"
+    }
+  ]
+}
+```
+
+| Name                    | Type   | Required | Description                                                                                                                                                  |
+| ----------------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sensor`                | string | **Yes**  | Name of the sensor dependency whose readings are monitored.                                                                                                  |
+| `notifier`              | string | **Yes**  | Name of the generic service dependency that receives notification `DoCommand`s.                                                                              |
+| `rules`                 | array  | **Yes**  | One or more numeric trigger rules (see below). At least one rule is required.                                                                                |
+| `poll_interval_seconds` | number | No       | How often the sensor is polled, in seconds. Defaults to `10`.                                                                                                |
+| `cooldown_seconds`      | number | No       | Minimum time between repeat notifications while a rule stays triggered. `0` (default) means no repeat until the rule clears and fires again.                  |
+
+Each entry in `rules`:
+
+| Name        | Type   | Required | Description                                                                                                                                                  |
+| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `key`       | string | **Yes**  | The reading key to watch, e.g. `"temperature"`. Non-numeric or missing values are skipped.                                                                   |
+| `operator`  | string | **Yes**  | Comparison applied between the reading and `threshold`. One of `>`, `>=`, `<`, `<=`, `==`, `!=` (aliases: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`).             |
+| `threshold` | number | **Yes**  | The value the reading is compared against.                                                                                                                   |
+| `message`   | string | No       | Notification template. Supports placeholders `{key}`, `{value}`, `{threshold}`, `{operator}`. If omitted, a message like `temperature is 95 (> 90)` is used. |
+
+### Example Configuration
+
+```json
+{
+  "sensor": "outdoor-temp",
+  "notifier": "slack-notifier",
+  "poll_interval_seconds": 30,
+  "cooldown_seconds": 3600,
+  "rules": [
+    {
+      "key": "temperature",
+      "operator": ">",
+      "threshold": 90,
+      "message": "High temperature alert: {key} is {value} (limit {threshold})"
+    },
+    {
+      "key": "humidity",
+      "operator": "<",
+      "threshold": 20
+    }
+  ]
+}
+```
+
+### Readings
+
+Returns the most recent readings from the monitored sensor, plus a `<key>_triggered` boolean for each rule indicating whether it is currently firing.
+
+```json
+{
+  "temperature": 95.0,
+  "humidity": 35.0,
+  "temperature_triggered": true,
+  "humidity_triggered": false
+}
+```
+
+### DoCommand
+
+**`check`** - Force an immediate poll of the sensor (instead of waiting for the next interval), evaluating all rules and sending any notifications.
+
+```json
+{"check": true}
+```
+
+Returns:
+
+```json
+{"check": "ok"}
 ```

@@ -1,4 +1,7 @@
-package sensorbundle
+// Package statefulsensor implements the viam:sensor-bundle:stateful-sensor model:
+// a sensor that holds a value set via DoCommand, serves it through Readings, and
+// persists it to a file on disk so it survives restarts.
+package statefulsensor
 
 import (
 	"context"
@@ -14,14 +17,13 @@ import (
 	"go.viam.com/rdk/resource"
 )
 
-var (
-	StatefulSensor = resource.NewModel("viam", "sensor-bundle", "stateful-sensor")
-)
+// Model is the stateful-sensor model triplet.
+var Model = resource.NewModel("viam", "sensor-bundle", "stateful-sensor")
 
 func init() {
-	resource.RegisterComponent(sensor.API, StatefulSensor,
+	resource.RegisterComponent(sensor.API, Model,
 		resource.Registration[sensor.Sensor, *Config]{
-			Constructor: newSensorBundleStatefulSensor,
+			Constructor: newStatefulSensor,
 		},
 	)
 }
@@ -43,7 +45,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	return nil, nil, nil
 }
 
-type sensorBundleStatefulSensor struct {
+type statefulSensor struct {
 	resource.AlwaysRebuild
 	resource.Named
 
@@ -60,16 +62,17 @@ type sensorBundleStatefulSensor struct {
 	cancelFunc func()
 }
 
-func newSensorBundleStatefulSensor(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
+func newStatefulSensor(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
 	conf, err := resource.NativeConfig[*Config](rawConf)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewStatefulSensor(ctx, deps, rawConf.ResourceName(), conf, logger)
+	return New(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
-func NewStatefulSensor(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
+// New builds a stateful-sensor and loads any previously persisted value from disk.
+func New(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	filePath := conf.FilePath
@@ -77,7 +80,7 @@ func NewStatefulSensor(ctx context.Context, deps resource.Dependencies, name res
 		filePath = fmt.Sprintf("%s_state.json", name.Name)
 	}
 
-	s := &sensorBundleStatefulSensor{
+	s := &statefulSensor{
 		name:       name,
 		logger:     logger,
 		cfg:        conf,
@@ -97,7 +100,7 @@ func NewStatefulSensor(ctx context.Context, deps resource.Dependencies, name res
 
 // loadFromFile reads the persisted value from disk into memory. If the file does
 // not exist, it is created with the current (empty) value.
-func (s *sensorBundleStatefulSensor) loadFromFile() error {
+func (s *statefulSensor) loadFromFile() error {
 	data, err := os.ReadFile(s.filePath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -126,7 +129,7 @@ func (s *sensorBundleStatefulSensor) loadFromFile() error {
 }
 
 // saveToFile persists the current in-memory value to disk atomically.
-func (s *sensorBundleStatefulSensor) saveToFile() error {
+func (s *statefulSensor) saveToFile() error {
 	s.mu.RLock()
 	data, err := json.MarshalIndent(s.value, "", "  ")
 	s.mu.RUnlock()
@@ -156,11 +159,11 @@ func (s *sensorBundleStatefulSensor) saveToFile() error {
 	return nil
 }
 
-func (s *sensorBundleStatefulSensor) Name() resource.Name {
+func (s *statefulSensor) Name() resource.Name {
 	return s.name
 }
 
-func (s *sensorBundleStatefulSensor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+func (s *statefulSensor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -180,7 +183,7 @@ func (s *sensorBundleStatefulSensor) Readings(ctx context.Context, extra map[str
 //
 // The provided object becomes the sensor's value, is persisted to disk, and is
 // returned by Readings.
-func (s *sensorBundleStatefulSensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+func (s *statefulSensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	raw, ok := cmd["set"]
 	if !ok {
 		return nil, fmt.Errorf("unsupported command: expected a %q key", "set")
@@ -203,7 +206,7 @@ func (s *sensorBundleStatefulSensor) DoCommand(ctx context.Context, cmd map[stri
 	return map[string]interface{}{"set": "ok"}, nil
 }
 
-func (s *sensorBundleStatefulSensor) Close(context.Context) error {
+func (s *statefulSensor) Close(context.Context) error {
 	s.cancelFunc()
 	return nil
 }
