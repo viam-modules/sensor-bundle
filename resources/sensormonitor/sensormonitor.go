@@ -1,4 +1,7 @@
-package sensorbundle
+// Package sensormonitor implements the viam:sensor-bundle:sensor-monitor model: a
+// sensor that watches another sensor's readings against numeric trigger rules and
+// sends a notification via a generic service's DoCommand when a threshold is crossed.
+package sensormonitor
 
 import (
 	"context"
@@ -15,13 +18,14 @@ import (
 	generic "go.viam.com/rdk/services/generic"
 )
 
-// SensorMonitor watches the readings of a sensor and fires notifications through a
-// generic service when a numeric reading crosses a configured threshold.
-var SensorMonitor = resource.NewModel("viam", "sensor-bundle", "sensor-monitor")
+// Model is the sensor-monitor model triplet. It watches the readings of a sensor
+// and fires notifications through a generic service when a numeric reading crosses
+// a configured threshold.
+var Model = resource.NewModel("viam", "sensor-bundle", "sensor-monitor")
 
 func init() {
-	resource.RegisterComponent(sensor.API, SensorMonitor,
-		resource.Registration[sensor.Sensor, *MonitorConfig]{
+	resource.RegisterComponent(sensor.API, Model,
+		resource.Registration[sensor.Sensor, *Config]{
 			Constructor: newSensorMonitor,
 		},
 	)
@@ -44,8 +48,8 @@ type Rule struct {
 	Message string `json:"message,omitempty"`
 }
 
-// MonitorConfig is the configuration for the sensor-monitor model.
-type MonitorConfig struct {
+// Config is the configuration for the sensor-monitor model.
+type Config struct {
 	// Sensor is the name of the sensor dependency whose readings are monitored.
 	Sensor string `json:"sensor"`
 	// Notifier is the name of the generic service dependency that receives
@@ -62,7 +66,7 @@ type MonitorConfig struct {
 }
 
 // Validate checks the config and returns the required dependency names.
-func (cfg *MonitorConfig) Validate(path string) ([]string, []string, error) {
+func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.Sensor == "" {
 		return nil, nil, fmt.Errorf("%s: missing required field 'sensor'", path)
 	}
@@ -95,7 +99,7 @@ type sensorMonitor struct {
 	resource.AlwaysRebuild
 
 	logger logging.Logger
-	cfg    *MonitorConfig
+	cfg    *Config
 
 	sensorDep   sensor.Sensor
 	notifierDep generic.Service
@@ -113,15 +117,15 @@ type sensorMonitor struct {
 }
 
 func newSensorMonitor(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (sensor.Sensor, error) {
-	conf, err := resource.NativeConfig[*MonitorConfig](rawConf)
+	conf, err := resource.NativeConfig[*Config](rawConf)
 	if err != nil {
 		return nil, err
 	}
-	return NewSensorMonitor(ctx, deps, rawConf.ResourceName(), conf, logger)
+	return New(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
-// NewSensorMonitor builds a sensor-monitor and starts its background polling loop.
-func NewSensorMonitor(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *MonitorConfig, logger logging.Logger) (sensor.Sensor, error) {
+// New builds a sensor-monitor and starts its background polling loop.
+func New(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
 	sensorDep, err := sensor.FromProvider(deps, conf.Sensor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sensor dependency %q: %w", conf.Sensor, err)

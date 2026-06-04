@@ -1,4 +1,4 @@
-package sensorbundle
+package sensormonitor
 
 import (
 	"context"
@@ -86,7 +86,7 @@ func (f *fakeNotifier) texts() []string {
 
 // newTestMonitor builds a monitor wired to the given fakes. A very large poll
 // interval keeps the background ticker dormant so tests drive poll() directly.
-func newTestMonitor(t *testing.T, cfg *MonitorConfig, src *fakeSensor, notifier *fakeNotifier) *sensorMonitor {
+func newTestMonitor(t *testing.T, cfg *Config, src *fakeSensor, notifier *fakeNotifier) *sensorMonitor {
 	t.Helper()
 	if cfg.PollIntervalSec == 0 {
 		cfg.PollIntervalSec = 3600
@@ -96,9 +96,9 @@ func newTestMonitor(t *testing.T, cfg *MonitorConfig, src *fakeSensor, notifier 
 		generic.Named(cfg.Notifier): notifier,
 	}
 	name := resource.NewName(sensor.API, "monitor")
-	s, err := NewSensorMonitor(context.Background(), deps, name, cfg, logging.NewTestLogger(t))
+	s, err := New(context.Background(), deps, name, cfg, logging.NewTestLogger(t))
 	if err != nil {
-		t.Fatalf("NewSensorMonitor: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close(context.Background()) })
 	return s.(*sensorMonitor)
@@ -107,38 +107,38 @@ func newTestMonitor(t *testing.T, cfg *MonitorConfig, src *fakeSensor, notifier 
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string
-		cfg     MonitorConfig
+		cfg     Config
 		wantErr bool
 		reqDeps []string
 	}{
 		{
 			name:    "valid",
-			cfg:     MonitorConfig{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
+			cfg:     Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
 			reqDeps: []string{"s", "n"},
 		},
 		{
 			name:    "missing sensor",
-			cfg:     MonitorConfig{Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
+			cfg:     Config{Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
 			wantErr: true,
 		},
 		{
 			name:    "missing notifier",
-			cfg:     MonitorConfig{Sensor: "s", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
+			cfg:     Config{Sensor: "s", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1}}},
 			wantErr: true,
 		},
 		{
 			name:    "no rules",
-			cfg:     MonitorConfig{Sensor: "s", Notifier: "n"},
+			cfg:     Config{Sensor: "s", Notifier: "n"},
 			wantErr: true,
 		},
 		{
 			name:    "rule missing key",
-			cfg:     MonitorConfig{Sensor: "s", Notifier: "n", Rules: []Rule{{Operator: ">", Threshold: 1}}},
+			cfg:     Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Operator: ">", Threshold: 1}}},
 			wantErr: true,
 		},
 		{
 			name:    "rule bad operator",
-			cfg:     MonitorConfig{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: "=>", Threshold: 1}}},
+			cfg:     Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: "=>", Threshold: 1}}},
 			wantErr: true,
 		},
 	}
@@ -244,7 +244,7 @@ func TestEdgeTriggeredNotifies(t *testing.T) {
 	src.set(map[string]interface{}{"temperature": 50.0})
 	notifier := newFakeNotifier("notify")
 
-	m := newTestMonitor(t, &MonitorConfig{
+	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
 		Rules:    []Rule{{Key: "temperature", Operator: ">", Threshold: 90}},
@@ -285,7 +285,7 @@ func TestReadingsExposesTriggerState(t *testing.T) {
 	ctx := context.Background()
 	src := newFakeSensor("src")
 	notifier := newFakeNotifier("notify")
-	m := newTestMonitor(t, &MonitorConfig{
+	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
 		Rules:    []Rule{{Key: "humidity", Operator: "<", Threshold: 30}},
@@ -311,7 +311,7 @@ func TestDoCommandCheckForcesPoll(t *testing.T) {
 	src := newFakeSensor("src")
 	src.set(map[string]interface{}{"temperature": 95.0})
 	notifier := newFakeNotifier("notify")
-	m := newTestMonitor(t, &MonitorConfig{
+	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
 		Rules:    []Rule{{Key: "temperature", Operator: ">", Threshold: 90}},
