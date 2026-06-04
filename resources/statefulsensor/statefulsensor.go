@@ -75,9 +75,19 @@ func newStatefulSensor(ctx context.Context, deps resource.Dependencies, rawConf 
 func New(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (sensor.Sensor, error) {
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
+	// When no file_path is configured, default to a file in the module's data
+	// directory. Viam sets VIAM_MODULE_DATA to a per-module directory that is
+	// created for us and guaranteed writable; persisting there keeps state
+	// stable across restarts and redeploys. Fall back to the current working
+	// directory (e.g. local runs and tests) when the env var is not set.
 	filePath := conf.FilePath
 	if filePath == "" {
-		filePath = fmt.Sprintf("%s_state.json", name.Name)
+		fileName := fmt.Sprintf("%s_state.json", name.Name)
+		if dataDir := os.Getenv("VIAM_MODULE_DATA"); dataDir != "" {
+			filePath = filepath.Join(dataDir, fileName)
+		} else {
+			filePath = fileName
+		}
 	}
 
 	s := &statefulSensor{
