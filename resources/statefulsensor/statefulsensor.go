@@ -49,7 +49,6 @@ type statefulSensor struct {
 	resource.AlwaysRebuild
 	resource.Named
 
-	name   resource.Name
 	logger logging.Logger
 	cfg    *Config
 
@@ -91,7 +90,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	}
 
 	s := &statefulSensor{
-		name:       name,
+		Named:      name.AsNamed(),
 		logger:     logger,
 		cfg:        conf,
 		filePath:   filePath,
@@ -169,10 +168,6 @@ func (s *statefulSensor) saveToFile() error {
 	return nil
 }
 
-func (s *statefulSensor) Name() resource.Name {
-	return s.name
-}
-
 func (s *statefulSensor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -183,6 +178,22 @@ func (s *statefulSensor) Readings(ctx context.Context, extra map[string]interfac
 		readings[k] = v
 	}
 	return readings, nil
+}
+
+// Status reports operational metadata for the sensor, served via the sensor
+// service's GetStatus RPC. It is defined explicitly (rather than relying on the
+// empty default promoted from the embedded resource.Named) so the model both
+// exposes useful state and is guaranteed to have a non-nil receiver. Unlike
+// Readings, which returns the stored value itself, Status reports where the
+// value is persisted and how many keys it holds.
+func (s *statefulSensor) Status(ctx context.Context) (map[string]interface{}, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return map[string]interface{}{
+		"file_path": s.filePath,
+		"num_keys":  len(s.value),
+	}, nil
 }
 
 // DoCommand supports a "set" command that replaces the value the sensor holds.
