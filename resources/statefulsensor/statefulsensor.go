@@ -196,18 +196,43 @@ func (s *statefulSensor) Status(ctx context.Context) (map[string]interface{}, er
 	}, nil
 }
 
-// DoCommand supports a "set" command that replaces the value the sensor holds.
+// DoCommand supports two commands:
 //
-// Example:
+//   - "set" replaces the entire value the sensor holds:
+//     {"set": {"temperature": 72.5, "unit": "F"}}
+//   - "merge" overlays the given keys onto the existing value, leaving keys not
+//     mentioned untouched: {"merge": {"usage": 0}}
 //
-//	{"set": {"temperature": 72.5, "unit": "F"}}
-//
-// The provided object becomes the sensor's value, is persisted to disk, and is
-// returned by Readings.
+// In both cases the result is persisted to disk and returned by Readings.
 func (s *statefulSensor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	if raw, ok := cmd["merge"]; ok {
+		patch, ok := raw.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("%q must be an object mapping keys to values, got %T", "merge", raw)
+		}
+
+		s.mu.Lock()
+		// Guard against a nil map (sensor never set, empty state file): writing to
+		// a nil map panics, so initialize before overlaying the patch.
+		if s.value == nil {
+			s.value = make(map[string]interface{}, len(patch))
+		}
+		for k, v := range patch {
+			s.value[k] = v
+		}
+		s.mu.Unlock()
+
+		if err := s.saveToFile(); err != nil {
+			return nil, err
+		}
+
+		s.logger.Infof("merged %+v", patch)
+		return map[string]interface{}{"merge": "ok"}, nil
+	}
+
 	raw, ok := cmd["set"]
 	if !ok {
-		return nil, fmt.Errorf("unsupported command: expected a %q key", "set")
+		return nil, fmt.Errorf("unsupported command: expected a %q or %q key", "set", "merge")
 	}
 
 	value, ok := raw.(map[string]interface{})

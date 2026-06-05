@@ -127,6 +127,63 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestMergeUpdatesOneKeyAndPreservesOthers(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := newTestSensor(t, path)
+
+	// Seed the full coffee-machine state.
+	full := map[string]interface{}{
+		"usage":          11.5,
+		"regular_grinds": 9.0,
+		"decaf_grinds":   3.0,
+		"cleanings":      11.0,
+	}
+	if _, err := s.DoCommand(ctx, map[string]interface{}{"set": full}); err != nil {
+		t.Fatalf("DoCommand set: %v", err)
+	}
+
+	// Reset only usage, as a "filled water tank" button would.
+	if _, err := s.DoCommand(ctx, map[string]interface{}{"merge": map[string]interface{}{"usage": 0.0}}); err != nil {
+		t.Fatalf("DoCommand merge: %v", err)
+	}
+
+	got, err := s.Readings(ctx, nil)
+	if err != nil {
+		t.Fatalf("Readings: %v", err)
+	}
+	if got["usage"] != 0.0 {
+		t.Fatalf("usage = %v, want 0 after merge", got["usage"])
+	}
+	// The whole point of merge: the other counters are untouched.
+	if got["regular_grinds"] != 9.0 || got["decaf_grinds"] != 3.0 || got["cleanings"] != 11.0 {
+		t.Fatalf("merge clobbered other keys: %+v", got)
+	}
+}
+
+func TestMergeOnNilValueDoesNotPanic(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.json")
+	// A state file containing the literal "null" unmarshals to a nil map, which
+	// would panic on write without the guard in DoCommand.
+	if err := os.WriteFile(path, []byte("null"), 0o600); err != nil {
+		t.Fatalf("write state file: %v", err)
+	}
+	s := newTestSensor(t, path)
+
+	if _, err := s.DoCommand(ctx, map[string]interface{}{"merge": map[string]interface{}{"usage": 0.0}}); err != nil {
+		t.Fatalf("DoCommand merge on nil value: %v", err)
+	}
+
+	got, err := s.Readings(ctx, nil)
+	if err != nil {
+		t.Fatalf("Readings: %v", err)
+	}
+	if got["usage"] != 0.0 {
+		t.Fatalf("usage = %v, want 0", got["usage"])
+	}
+}
+
 func TestDoCommandRejectsUnknownCommand(t *testing.T) {
 	ctx := context.Background()
 	s := newTestSensor(t, filepath.Join(t.TempDir(), "state.json"))
