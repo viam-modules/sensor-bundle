@@ -93,6 +93,40 @@ func TestDefaultPathUsesModuleDataDir(t *testing.T) {
 	}
 }
 
+// TestStatus verifies the explicit Status API. It also guards against a
+// regression where the embedded resource.Named was left uninitialized: the
+// sensor service's GetStatus RPC calls Status on the resource, and with a nil
+// embedded Named the promoted default Status dereferenced a nil receiver and
+// crashed the module (SIGSEGV).
+func TestStatus(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := newTestSensor(t, path)
+
+	status, err := s.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status["file_path"] != path {
+		t.Fatalf("Status file_path = %v, want %q", status["file_path"], path)
+	}
+	if status["num_keys"] != 0 {
+		t.Fatalf("Status num_keys = %v, want 0", status["num_keys"])
+	}
+
+	if _, err := s.DoCommand(ctx, map[string]interface{}{"set": map[string]interface{}{"a": 1.0, "b": 2.0}}); err != nil {
+		t.Fatalf("DoCommand set: %v", err)
+	}
+
+	status, err = s.Status(ctx)
+	if err != nil {
+		t.Fatalf("Status after set: %v", err)
+	}
+	if status["num_keys"] != 2 {
+		t.Fatalf("Status num_keys = %v, want 2", status["num_keys"])
+	}
+}
+
 func TestDoCommandRejectsUnknownCommand(t *testing.T) {
 	ctx := context.Background()
 	s := newTestSensor(t, filepath.Join(t.TempDir(), "state.json"))
