@@ -306,7 +306,7 @@ func TestReactsOnResolve(t *testing.T) {
 	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
-		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15, ResolveReaction: "white_check_mark"}},
 	}, src, notifier)
 
 	// Cross the threshold: one alert, captured ts, no reaction yet.
@@ -330,7 +330,7 @@ func TestReactsOnResolve(t *testing.T) {
 		t.Fatalf("expected 1 reaction on resolve, got %d: %v", len(reactions), reactions)
 	}
 	r := reactions[0]
-	if r["name"] != defaultResolveReaction || r["timestamp"] != "100.1" || r["channel"] != "C0ALERTS" {
+	if r["name"] != "white_check_mark" || r["timestamp"] != "100.1" || r["channel"] != "C0ALERTS" {
 		t.Fatalf("reaction payload not as expected: %v", r)
 	}
 
@@ -349,7 +349,7 @@ func TestNoReactionWithoutTS(t *testing.T) {
 	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
-		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15, ResolveReaction: "white_check_mark"}},
 	}, src, notifier)
 
 	src.set(map[string]interface{}{"usage": 20.0})
@@ -362,15 +362,15 @@ func TestNoReactionWithoutTS(t *testing.T) {
 	}
 }
 
-func TestResolveReactionDisabled(t *testing.T) {
+func TestNoReactionWhenUnconfigured(t *testing.T) {
 	ctx := context.Background()
 	src := newFakeSensor("src")
 	notifier := newFakeNotifier("notify")
+	// resolve_reaction unset: alerts still fire, but nothing is reacted to.
 	m := newTestMonitor(t, &Config{
-		Sensor:          "src",
-		Notifier:        "notify",
-		ResolveReaction: "-",
-		Rules:           []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
 	}, src, notifier)
 
 	src.set(map[string]interface{}{"usage": 20.0})
@@ -378,8 +378,11 @@ func TestResolveReactionDisabled(t *testing.T) {
 	src.set(map[string]interface{}{"usage": 0.0})
 	m.poll(ctx)
 
+	if got := len(notifier.texts()); got != 1 {
+		t.Fatalf("expected the alert to still be sent, got %d", got)
+	}
 	if got := len(notifier.reactions()); got != 0 {
-		t.Fatalf("expected no reaction when disabled, got %d", got)
+		t.Fatalf("expected no reaction when resolve_reaction is unset, got %d", got)
 	}
 }
 
@@ -391,7 +394,7 @@ func TestReactsToLatestMessageAfterCooldownRenotify(t *testing.T) {
 		Sensor:      "src",
 		Notifier:    "notify",
 		CooldownSec: 60, // long cooldown; we backdate lastNotified to force a re-notify
-		Rules:       []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+		Rules:       []Rule{{Key: "usage", Operator: ">=", Threshold: 15, ResolveReaction: "white_check_mark"}},
 	}, src, notifier)
 
 	src.set(map[string]interface{}{"usage": 20.0})

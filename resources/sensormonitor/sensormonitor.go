@@ -34,14 +34,6 @@ func init() {
 // defaultPollInterval is used when poll_interval_seconds is not set.
 const defaultPollInterval = 10 * time.Second
 
-// defaultResolveReaction is the emoji added to the original alert message when a
-// rule clears, unless resolve_reaction overrides it.
-const defaultResolveReaction = "white_check_mark"
-
-// reactionDisabled is the resolve_reaction sentinel that turns off reacting on
-// resolve.
-const reactionDisabled = "-"
-
 // Rule describes a single numeric trigger on one reading key.
 type Rule struct {
 	// Key is the reading key to watch, e.g. "temperature".
@@ -54,6 +46,13 @@ type Rule struct {
 	// Message is an optional notification template. It supports the placeholders
 	// {key}, {value}, {threshold} and {operator}. If empty, a message is generated.
 	Message string `json:"message,omitempty"`
+	// ResolveReaction is the emoji name (without colons, e.g. "white_check_mark")
+	// to add as a reaction to this rule's alert message when the rule clears (its
+	// reading returns to the non-triggered side of the threshold). When unset, no
+	// reaction is added. Requires the notifier to support a {"command": "react",
+	// ...} DoCommand and to have returned a message "ts" on send (the Slack
+	// bot-token path).
+	ResolveReaction string `json:"resolve_reaction,omitempty"`
 }
 
 // Config is the configuration for the sensor-monitor model.
@@ -71,13 +70,6 @@ type Config struct {
 	// stays triggered, in seconds. 0 (default) means do not re-notify until the
 	// rule clears and fires again.
 	CooldownSec float64 `json:"cooldown_seconds,omitempty"`
-	// ResolveReaction is the emoji name (without colons) added as a reaction to
-	// the original alert message when a rule clears (value returns to the
-	// non-triggered side of the threshold). Requires the notifier to support a
-	// {"command": "react", ...} DoCommand and to have returned a message "ts" on
-	// send (the Slack bot-token path). Defaults to "white_check_mark". Set to
-	// "-" to disable reacting on resolve.
-	ResolveReaction string `json:"resolve_reaction,omitempty"`
 }
 
 // Validate checks the config and returns the required dependency names.
@@ -125,9 +117,8 @@ type sensorMonitor struct {
 	sensorDep   sensor.Sensor
 	notifierDep generic.Service
 
-	pollInterval    time.Duration
-	cooldown        time.Duration
-	resolveReaction string
+	pollInterval time.Duration
+	cooldown     time.Duration
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -178,26 +169,20 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	}
 	cooldown := time.Duration(conf.CooldownSec * float64(time.Second))
 
-	resolveReaction := conf.ResolveReaction
-	if resolveReaction == "" {
-		resolveReaction = defaultResolveReaction
-	}
-
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	return &sensorMonitor{
-		Named:           name.AsNamed(),
-		logger:          logger,
-		cfg:             conf,
-		sensorDep:       sensorDep,
-		notifierDep:     notifierDep,
-		pollInterval:    pollInterval,
-		cooldown:        cooldown,
-		resolveReaction: resolveReaction,
-		cancelCtx:       cancelCtx,
-		cancelFunc:      cancelFunc,
-		lastReadings:    map[string]interface{}{},
-		ruleStates:      make([]ruleState, len(conf.Rules)),
+		Named:        name.AsNamed(),
+		logger:       logger,
+		cfg:          conf,
+		sensorDep:    sensorDep,
+		notifierDep:  notifierDep,
+		pollInterval: pollInterval,
+		cooldown:     cooldown,
+		cancelCtx:    cancelCtx,
+		cancelFunc:   cancelFunc,
+		lastReadings: map[string]interface{}{},
+		ruleStates:   make([]ruleState, len(conf.Rules)),
 	}, nil
 }
 
@@ -267,10 +252,10 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 			st.lastNotified = now
 			notify = true
 		case !fired:
-			// Edge from triggered to cleared: the rule just resolved. If we have a
-			// message to react to, capture it now and clear the stored identity so
-			// we react exactly once.
-			if st.triggered && st.msgTS != "" {
+			// Edge from triggered to cleared: the rule just resolved. When a resolve
+			// reaction is configured and we have a message to react to, capture it
+			// now and clear the stored identity so we react exactly once.
+			if st.triggered && st.msgTS != "" && rule.ResolveReaction != "" {
 				resolved = true
 				reactChannel = st.msgChannel
 				reactTS = st.msgTS
@@ -321,17 +306,15 @@ func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value f
 	return channel, ts
 }
 
-// sendResolveReaction asks the notifier to add the configured emoji reaction to
-// a previously-sent alert message once its rule has cleared. Best-effort: a
-// failure (e.g. a notifier that doesn't support "react", or a webhook notifier)
-// is logged and never affects monitoring.
+// sendResolveReaction asks the notifier to add the rule's resolve_reaction emoji
+// to a previously-sent alert message once the rule has cleared. Only called when
+// the rule's resolve_reaction is set. Best-effort: a failure (e.g. a notifier
+// that doesn't support "react", or a webhook notifier) is logged and never
+// affects monitoring.
 func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, channel, ts string) {
-	if m.resolveReaction == reactionDisabled {
-		return
-	}
 	cmd := map[string]interface{}{
 		"command":   "react",
-		"name":      m.resolveReaction,
+		"name":      rule.ResolveReaction,
 		"channel":   channel,
 		"timestamp": ts,
 	}
@@ -339,7 +322,7 @@ func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, chan
 		m.logger.Warnf("failed to react to resolved alert for %q via %q: %v", rule.Key, m.cfg.Notifier, err)
 		return
 	}
-	m.logger.Infof("reacted :%s: to resolved alert for %q", m.resolveReaction, rule.Key)
+	m.logger.Infof("reacted :%s: to resolved alert for %q", rule.ResolveReaction, rule.Key)
 }
 
 // Readings returns the most recent sensor readings plus, per rule, a
