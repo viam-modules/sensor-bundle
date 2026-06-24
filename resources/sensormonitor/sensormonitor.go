@@ -36,14 +36,10 @@ func init() {
 // defaultPollInterval is used when poll_interval_seconds is not set.
 const defaultPollInterval = 10 * time.Second
 
-// Action is a DoCommand to fire on a resource when a rule changes state. The
-// call is always DoCommand, so the resource may be any type (component or
-// service).
+// Action is a DoCommand to fire on a resource when a rule changes state.
 type Action struct {
-	// Resource is the name of the resource to call.
-	Resource string `json:"resource"`
-	// Command is the DoCommand payload sent to the resource.
-	Command map[string]interface{} `json:"command"`
+	Resource string                 `json:"resource"`
+	Command  map[string]interface{} `json:"command"`
 }
 
 // Rule describes a single numeric trigger on one reading key.
@@ -60,8 +56,7 @@ type Rule struct {
 	Message string `json:"message,omitempty"`
 	// OnTrigger lists DoCommands to fire when the rule transitions to triggered.
 	OnTrigger []Action `json:"on_trigger,omitempty"`
-	// OnResolve lists DoCommands to fire when the rule clears (its reading returns
-	// to the non-triggered side of the threshold).
+	// OnResolve lists DoCommands to fire when the rule clears
 	OnResolve []Action `json:"on_resolve,omitempty"`
 }
 
@@ -156,8 +151,7 @@ type sensorMonitor struct {
 	sensorDep   sensor.Sensor
 	notifierDep generic.Service
 	// actionResources holds every resource named by a rule action, resolved once
-	// at construction and keyed by name. Any resource type works — actions only
-	// ever call DoCommand.
+	// at construction and keyed by name.
 	actionResources map[string]resource.Resource
 
 	pollInterval time.Duration
