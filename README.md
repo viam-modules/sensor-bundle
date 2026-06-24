@@ -71,7 +71,7 @@ Returns:
 
 Monitors the readings of another sensor and, when a numeric reading crosses a configured threshold, fires `DoCommand` **actions** on other resources. It evaluates a set of numeric trigger rules on every poll; the only dependency is the sensor to watch (plus whatever resources the actions target).
 
-**Actions.** Each rule has an `on_trigger` and an `on_resolve` list. Every action names a `resource` (any component or service on the machine, by name) and a `command` (the `DoCommand` payload sent to it). Notifying is just an action — point one at a notification service with `{ "command": "send", "text": "..." }`.
+**Actions.** Each rule has an `on_trigger` and an `on_resolve` list. Every action names a `resource` (any component or service on the machine, by name) and a `command` (the `DoCommand` payload sent to it).
 
 - `on_trigger` fires when the rule transitions from not-triggered to triggered, and again at most once per `cooldown_seconds` while it stays triggered (with the default `cooldown_seconds: 0`, that's edge-only).
 - `on_resolve` fires once when the reading clears the threshold.
@@ -82,7 +82,7 @@ Monitors the readings of another sensor and, when a numeric reading crosses a co
 - Rule/reading context: `${value}` (the current reading), `${key}`, `${threshold}`, `${operator}`.
 - Captured responses: set `"capture": "<name>"` on an action to store its `DoCommand` response, then reference its fields from later actions (including `on_resolve`) as `${<name>.<field>}`.
 
-A value that is exactly one reference keeps the referenced value's type; a reference embedded in a larger string is substituted as text. If a reference can't be resolved (e.g. nothing was captured), that action is skipped. This is how a message sent on trigger gets reacted to on resolve — capture the send response, then reference its `ts`/`channel` in the resolve action. A capture is overwritten on each cooldown re-fire (so resolve references the most recent response) and cleared once the rule resolves.
+A value that is exactly one reference keeps the referenced value's type; a reference embedded in a larger string is substituted as text. If a reference can't be resolved (e.g. nothing was captured), that action is skipped. A capture is overwritten on each cooldown re-fire (so resolve references the most recent response) and cleared once the rule resolves.
 
 ### Configuration
 

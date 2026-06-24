@@ -1,8 +1,7 @@
 // Package sensormonitor implements the viam:sensor-bundle:sensor-monitor model: a
 // sensor that watches another sensor's readings against numeric trigger rules and
 // fires configurable DoCommand actions on other resources when a rule triggers or
-// resolves. An action can capture its response, and later actions can reference
-// it — so, for example, a message sent on trigger can be reacted to on resolve.
+// resolves.
 package sensormonitor
 
 import (
@@ -38,13 +37,13 @@ const defaultPollInterval = 10 * time.Second
 
 // Action is a DoCommand to fire on a resource when a rule changes state.
 type Action struct {
-	// Resource is the name of the resource to call (any component or service).
+	// Resource is the name of the resource to call.
 	Resource string `json:"resource"`
 	// Command is the DoCommand payload. String values may contain ${...}
 	// references that are resolved before the command is sent — see resolveValue.
 	Command map[string]interface{} `json:"command"`
 	// Capture, when set, stores this action's response under this name so later
-	// actions (including on_resolve) can reference its fields as ${name.field}.
+	// actions can reference its fields as ${name.field}.
 	Capture string `json:"capture,omitempty"`
 }
 
@@ -78,8 +77,7 @@ type Config struct {
 	CooldownSec float64 `json:"cooldown_seconds,omitempty"`
 }
 
-// Validate checks the config and returns the required dependency names: the
-// watched sensor plus every resource named by an action.
+// Validate checks the config and returns the required dependency names.
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.Sensor == "" {
 		return nil, nil, fmt.Errorf("%s: missing required field 'sensor'", path)
@@ -137,8 +135,7 @@ type ruleState struct {
 	lastFired time.Time
 	lastValue float64
 	// vars holds the responses of actions that set "capture", keyed by capture
-	// name, so on_resolve actions can reference values produced on trigger. Reset
-	// when the rule resolves.
+	// name, so later actions can reference values produced. Reset when the rule resolves.
 	vars map[string]interface{}
 }
 
@@ -151,8 +148,7 @@ type sensorMonitor struct {
 
 	sensorDep sensor.Sensor
 	// actionResources holds every resource named by a rule action, resolved once
-	// at construction and keyed by name. Any resource type works — actions only
-	// ever call DoCommand.
+	// at construction and keyed by name.
 	actionResources map[string]resource.Resource
 
 	pollInterval time.Duration
@@ -197,8 +193,7 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 		return nil, fmt.Errorf("failed to get sensor dependency %q: %w", conf.Sensor, err)
 	}
 
-	// Resolve every resource named by an action up front (any API), so firing is a
-	// simple map lookup + DoCommand.
+	// Resolve every resource named by an action up front so firing is a simple map lookup + DoCommand.
 	actionResources := map[string]resource.Resource{}
 	resolveAction := func(a Action) error {
 		if _, ok := actionResources[a.Resource]; ok {
@@ -287,8 +282,7 @@ func (m *sensorMonitor) run() {
 	}
 }
 
-// poll reads the sensor once, evaluates every rule, and fires the rule's actions
-// on the trigger and resolve edges (and on cooldown repeats while triggered).
+// poll reads the sensor once, evaluates every rule, and fires the rule's actions.
 func (m *sensorMonitor) poll(ctx context.Context) {
 	readings, err := m.sensorDep.Readings(ctx, nil)
 	if err != nil {
