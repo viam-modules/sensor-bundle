@@ -49,8 +49,7 @@ type Rule struct {
 	// ResolveReaction is the emoji name (e.g. "white_check_mark") to add as a
 	// reaction to this rule's alert message when the rule reading returns to
 	// the non-triggered side of the threshold. When unset, no reaction is added.
-	// Requires the notifier to support a {"command": "react", ...} DoCommand and to have returned a message "ts" on send (the Slack
-	// bot-token path).
+	// Requires the notifier to support a {"command": "react", ...} DoCommand
 	ResolveReaction string `json:"resolve_reaction,omitempty"`
 }
 
@@ -98,12 +97,8 @@ type ruleState struct {
 	triggered    bool
 	lastNotified time.Time
 	lastValue    float64
-	// sentMessage is the notifier's response to this rule's most recent alert
-	// send, retained opaquely and handed back to the notifier to react to that
-	// message when the rule clears. nil when no alert is outstanding. The monitor
-	// does not interpret its contents — they are notifier-specific (e.g. Slack
-	// returns a channel and message ts), which keeps the monitor decoupled from
-	// any particular notifier.
+	// sentMessage is opaque metadata about the most recently sent message, kept
+	// as-is for later use. nil when no alert is outstanding.
 	sentMessage map[string]interface{}
 }
 
@@ -279,9 +274,8 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 	}
 }
 
-// sendNotification renders the rule's message and calls DoCommand on the
-// notifier, returning the notifier's response so the sent message can be reacted
-// to later. Returns nil on failure.
+// sendNotification renders the rule's message and sends it via the notifier,
+// returning the notifier's response (nil on failure).
 func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) map[string]interface{} {
 	msg := renderMessage(rule, value)
 	cmd := map[string]interface{}{
@@ -297,13 +291,10 @@ func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value f
 	return resp
 }
 
-// sendResolveReaction asks the notifier to add the rule's resolve_reaction emoji
-// to a previously-sent alert message once the rule has cleared. It hands the
-// notifier's own send response (sentMessage) back with the reaction name added,
-// so the monitor never has to know how the notifier identifies a message. Only
-// called when the rule's resolve_reaction is set. Best-effort: a failure (e.g. a
-// notifier that doesn't support "react", or one that can't react such as a Slack
-// webhook) is logged and never affects monitoring.
+// sendResolveReaction reacts to the rule's earlier alert message with the
+// configured emoji once the rule has cleared, passing the stored sentMessage
+// metadata back through unchanged. Only called when resolve_reaction is set.
+// Best-effort: a failure is logged and never affects monitoring.
 func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, sentMessage map[string]interface{}) {
 	cmd := make(map[string]interface{}, len(sentMessage)+2)
 	for k, v := range sentMessage {

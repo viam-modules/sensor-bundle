@@ -79,7 +79,7 @@ When a rule fires, the monitor calls `DoCommand` on the notifier with the payloa
 
 Notifications are **edge-triggered**: a message is sent when a rule transitions from not-triggered to triggered. While the rule stays triggered no further message is sent, unless `cooldown_seconds` is set, in which case the message repeats at most once per cooldown window. When the reading clears the threshold and crosses it again, a new notification is sent.
 
-**Reacting on resolve.** When a rule's `resolve_reaction` is set and that rule clears (its reading returns to the non-triggered side of the threshold), the monitor adds that emoji as a reaction to the rule's alert message, giving operators an at-a-glance "handled" marker without a follow-up message. This calls `DoCommand({"command": "react", "channel": ..., "timestamp": ..., "name": ...})` on the notifier, so it requires a notifier that supports the `react` command and returns a message `ts` on send (the [`viam:notifications:slack`](https://github.com/viam-modules/notifications) **bot-token** path). On a notifier that returns no `ts` (e.g. a Slack incoming webhook) there is nothing to react to and the step is silently skipped. When `resolve_reaction` is unset, no reaction is added. The reaction is best-effort: a failure is logged and never affects monitoring.
+**Reacting on resolve.** When a rule's `resolve_reaction` is set and that rule clears (its reading returns to the non-triggered side of the threshold), the monitor adds that emoji as a reaction to the rule's alert message, giving operators an at-a-glance "handled" marker without a follow-up message. To do this it calls `DoCommand({"command": "react", "name": <emoji>, ...})` on the notifier, passing back the metadata the notifier returned when it sent the message, so it requires a notifier that supports the `react` command. When `resolve_reaction` is unset, no reaction is added. The reaction is best-effort: a failure is logged and never affects monitoring.
 
 ### Configuration
 
@@ -117,7 +117,7 @@ Each entry in `rules`:
 | `operator`  | string | **Yes**  | Comparison applied between the reading and `threshold`. One of `>`, `>=`, `<`, `<=`, `==`, `!=` (aliases: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`).             |
 | `threshold` | number | **Yes**  | The value the reading is compared against.                                                                                                                   |
 | `message`   | string | No       | Notification template. Supports placeholders `{key}`, `{value}`, `{threshold}`, `{operator}`. If omitted, a message like `temperature is 95 (> 90)` is used. |
-| `resolve_reaction` | string | No | Emoji name (without colons, e.g. `white_check_mark`) added as a reaction to this rule's alert message when the rule clears. When unset, no reaction is added. Requires a notifier that supports the `react` command and returns a message `ts` on send. |
+| `resolve_reaction` | string | No | Emoji name (e.g. `white_check_mark`) added as a reaction to this rule's alert message when the rule clears. When unset, no reaction is added. Requires a notifier that supports the `react` command. |
 
 ### Example Configuration
 

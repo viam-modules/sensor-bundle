@@ -46,24 +46,20 @@ func (f *fakeSensor) Readings(ctx context.Context, extra map[string]interface{})
 
 func (f *fakeSensor) Close(context.Context) error { return nil }
 
-// fakeNotifier is a generic.Service that records the DoCommands it receives.
-// On a "send" it returns a synthetic response (the Slack bot-token shape: ts +
-// channel) so the monitor can capture a message identity to react to. sendExtra
-// adds arbitrary opaque fields to that response, used to prove the monitor hands
-// the whole response back on react without interpreting it.
+// fakeNotifier is a generic.Service that records the DoCommands it receives. A
+// "send" returns sendResp, an opaque map the monitor stores and later passes
+// back; the contents are arbitrary so the tests don't assume any notifier shape.
 type fakeNotifier struct {
 	resource.Named
 	resource.AlwaysRebuild
 
-	mu        sync.Mutex
-	received  []map[string]interface{}
-	sendTS    string
-	sendCh    string
-	sendExtra map[string]interface{}
+	mu       sync.Mutex
+	received []map[string]interface{}
+	sendResp map[string]interface{}
 }
 
 func newFakeNotifier(name string) *fakeNotifier {
-	return &fakeNotifier{Named: generic.Named(name).AsNamed(), sendTS: "100.1", sendCh: "C0ALERTS"}
+	return &fakeNotifier{Named: generic.Named(name).AsNamed(), sendResp: map[string]interface{}{"id": "m1"}}
 }
 
 func (f *fakeNotifier) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -71,14 +67,8 @@ func (f *fakeNotifier) DoCommand(ctx context.Context, cmd map[string]interface{}
 	defer f.mu.Unlock()
 	f.received = append(f.received, cmd)
 	if cmd["command"] == "send" {
-		resp := map[string]interface{}{"ok": true}
-		if f.sendTS != "" {
-			resp["ts"] = f.sendTS
-		}
-		if f.sendCh != "" {
-			resp["channel"] = f.sendCh
-		}
-		for k, v := range f.sendExtra {
+		resp := map[string]interface{}{}
+		for k, v := range f.sendResp {
 			resp[k] = v
 		}
 		return resp, nil
@@ -321,7 +311,7 @@ func TestReactsOnResolve(t *testing.T) {
 		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15, ResolveReaction: "white_check_mark"}},
 	}, src, notifier)
 
-	// Cross the threshold: one alert, captured ts, no reaction yet.
+	// Cross the threshold: one alert, no reaction yet.
 	src.set(map[string]interface{}{"usage": 15.0})
 	m.poll(ctx)
 	if got := len(notifier.reactions()); got != 0 {
@@ -334,7 +324,8 @@ func TestReactsOnResolve(t *testing.T) {
 		t.Fatalf("expected no reaction while still triggered, got %d", got)
 	}
 
-	// Counter reset below threshold (the streamdeck refill): react exactly once.
+	// Reading returns below threshold: react exactly once, carrying the configured
+	// emoji plus the opaque metadata from the send (passed back unchanged).
 	src.set(map[string]interface{}{"usage": 0.0})
 	m.poll(ctx)
 	reactions := notifier.reactions()
@@ -342,47 +333,14 @@ func TestReactsOnResolve(t *testing.T) {
 		t.Fatalf("expected 1 reaction on resolve, got %d: %v", len(reactions), reactions)
 	}
 	r := reactions[0]
-	if r["name"] != "white_check_mark" || r["ts"] != "100.1" || r["channel"] != "C0ALERTS" {
+	if r["name"] != "white_check_mark" || r["id"] != "m1" {
 		t.Fatalf("reaction payload not as expected: %v", r)
 	}
 
-	// Stays resolved: no further reactions (identity cleared).
+	// Stays resolved: no further reactions (metadata cleared).
 	m.poll(ctx)
 	if got := len(notifier.reactions()); got != 1 {
 		t.Fatalf("expected no repeat reaction, got %d", got)
-	}
-}
-
-// TestResolveReactionEchoesSendResponse proves the monitor hands the notifier's
-// entire send response back on react — including an opaque field it has no
-// knowledge of — rather than cherry-picking Slack-specific keys.
-func TestResolveReactionEchoesSendResponse(t *testing.T) {
-	ctx := context.Background()
-	src := newFakeSensor("src")
-	notifier := newFakeNotifier("notify")
-	notifier.sendExtra = map[string]interface{}{"thread_id": "T-9"} // a field the monitor knows nothing about
-	m := newTestMonitor(t, &Config{
-		Sensor:   "src",
-		Notifier: "notify",
-		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15, ResolveReaction: "white_check_mark"}},
-	}, src, notifier)
-
-	src.set(map[string]interface{}{"usage": 20.0})
-	m.poll(ctx)
-	src.set(map[string]interface{}{"usage": 0.0})
-	m.poll(ctx)
-
-	reactions := notifier.reactions()
-	if len(reactions) != 1 {
-		t.Fatalf("expected 1 reaction, got %d: %v", len(reactions), reactions)
-	}
-	r := reactions[0]
-	if r["command"] != "react" || r["name"] != "white_check_mark" {
-		t.Fatalf("react command/name not set: %v", r)
-	}
-	// The whole send response is forwarded verbatim, opaque field included.
-	if r["ts"] != "100.1" || r["channel"] != "C0ALERTS" || r["thread_id"] != "T-9" {
-		t.Fatalf("send response not echoed verbatim: %v", r)
 	}
 }
 
@@ -422,19 +380,19 @@ func TestReactsToLatestMessageAfterCooldownRenotify(t *testing.T) {
 	}, src, notifier)
 
 	src.set(map[string]interface{}{"usage": 20.0})
-	m.poll(ctx) // first alert: ts 100.1
+	m.poll(ctx) // first alert: metadata id m1
 
 	// Backdate so the cooldown has deterministically elapsed, then re-notify.
 	m.ruleStates[0].lastNotified = m.ruleStates[0].lastNotified.Add(-time.Hour)
-	notifier.sendTS = "200.2" // a re-notify will return a new ts
-	m.poll(ctx)               // cooldown elapsed: re-notify, ts 200.2
+	notifier.sendResp = map[string]interface{}{"id": "m2"} // the re-notify returns new metadata
+	m.poll(ctx)                                            // cooldown elapsed: re-notify, id m2
 
 	src.set(map[string]interface{}{"usage": 0.0})
 	m.poll(ctx) // resolve: should react to the latest message
 
 	reactions := notifier.reactions()
-	if len(reactions) != 1 || reactions[0]["ts"] != "200.2" {
-		t.Fatalf("expected reaction to latest ts 200.2, got %v", reactions)
+	if len(reactions) != 1 || reactions[0]["id"] != "m2" {
+		t.Fatalf("expected reaction to latest message m2, got %v", reactions)
 	}
 }
 
