@@ -1,6 +1,8 @@
 // Package sensormonitor implements the viam:sensor-bundle:sensor-monitor model: a
-// sensor that watches another sensor's readings against numeric trigger rules and
-// sends a notification via a generic service's DoCommand when a threshold is crossed.
+// sensor that watches another sensor's readings against numeric trigger rules,
+// sends a notification via a generic service's DoCommand when a threshold is
+// crossed, and can fire arbitrary DoCommands on other resources when a rule
+// triggers or resolves.
 package sensormonitor
 
 import (
@@ -34,6 +36,16 @@ func init() {
 // defaultPollInterval is used when poll_interval_seconds is not set.
 const defaultPollInterval = 10 * time.Second
 
+// Action is a DoCommand to fire on a resource when a rule changes state. The
+// call is always DoCommand, so the resource may be any type (component or
+// service).
+type Action struct {
+	// Resource is the name of the resource to call.
+	Resource string `json:"resource"`
+	// Command is the DoCommand payload sent to the resource.
+	Command map[string]interface{} `json:"command"`
+}
+
 // Rule describes a single numeric trigger on one reading key.
 type Rule struct {
 	// Key is the reading key to watch, e.g. "temperature".
@@ -46,6 +58,11 @@ type Rule struct {
 	// Message is an optional notification template. It supports the placeholders
 	// {key}, {value}, {threshold} and {operator}. If empty, a message is generated.
 	Message string `json:"message,omitempty"`
+	// OnTrigger lists DoCommands to fire when the rule transitions to triggered.
+	OnTrigger []Action `json:"on_trigger,omitempty"`
+	// OnResolve lists DoCommands to fire when the rule clears (its reading returns
+	// to the non-triggered side of the threshold).
+	OnResolve []Action `json:"on_resolve,omitempty"`
 }
 
 // Config is the configuration for the sensor-monitor model.
@@ -76,6 +93,18 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if len(cfg.Rules) == 0 {
 		return nil, nil, fmt.Errorf("%s: at least one rule is required", path)
 	}
+
+	// Required deps: the watched sensor, the notifier, and every resource named by
+	// an action. Collected in a deterministic order with duplicates removed.
+	deps := []string{cfg.Sensor, cfg.Notifier}
+	seen := map[string]bool{cfg.Sensor: true, cfg.Notifier: true}
+	addDep := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			deps = append(deps, name)
+		}
+	}
+
 	for i, r := range cfg.Rules {
 		if r.Key == "" {
 			return nil, nil, fmt.Errorf("%s: rules[%d] missing required field 'key'", path, i)
@@ -83,8 +112,31 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		if _, err := parseOperator(r.Operator); err != nil {
 			return nil, nil, fmt.Errorf("%s: rules[%d] %w", path, i, err)
 		}
+		for j, a := range r.OnTrigger {
+			if err := validateAction(a); err != nil {
+				return nil, nil, fmt.Errorf("%s: rules[%d].on_trigger[%d] %w", path, i, j, err)
+			}
+			addDep(a.Resource)
+		}
+		for j, a := range r.OnResolve {
+			if err := validateAction(a); err != nil {
+				return nil, nil, fmt.Errorf("%s: rules[%d].on_resolve[%d] %w", path, i, j, err)
+			}
+			addDep(a.Resource)
+		}
 	}
-	return []string{cfg.Sensor, cfg.Notifier}, nil, nil
+	return deps, nil, nil
+}
+
+// validateAction checks a single action's required fields.
+func validateAction(a Action) error {
+	if a.Resource == "" {
+		return fmt.Errorf("missing required field 'resource'")
+	}
+	if a.Command == nil {
+		return fmt.Errorf("missing required field 'command'")
+	}
+	return nil
 }
 
 // ruleState tracks the runtime state of a single rule across polls.
@@ -103,6 +155,10 @@ type sensorMonitor struct {
 
 	sensorDep   sensor.Sensor
 	notifierDep generic.Service
+	// actionResources holds every resource named by a rule action, resolved once
+	// at construction and keyed by name. Any resource type works — actions only
+	// ever call DoCommand.
+	actionResources map[string]resource.Resource
 
 	pollInterval time.Duration
 	cooldown     time.Duration
@@ -150,6 +206,33 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 		return nil, fmt.Errorf("failed to get notifier dependency %q: %w", conf.Notifier, err)
 	}
 
+	// Resolve every resource named by an action up front (any API), so firing is a
+	// simple map lookup + DoCommand.
+	actionResources := map[string]resource.Resource{}
+	resolveAction := func(a Action) error {
+		if _, ok := actionResources[a.Resource]; ok {
+			return nil
+		}
+		res, err := lookupResource(deps, a.Resource)
+		if err != nil {
+			return fmt.Errorf("action resource %q: %w", a.Resource, err)
+		}
+		actionResources[a.Resource] = res
+		return nil
+	}
+	for _, r := range conf.Rules {
+		for _, a := range r.OnTrigger {
+			if err := resolveAction(a); err != nil {
+				return nil, err
+			}
+		}
+		for _, a := range r.OnResolve {
+			if err := resolveAction(a); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	pollInterval := defaultPollInterval
 	if conf.PollIntervalSec > 0 {
 		pollInterval = time.Duration(conf.PollIntervalSec * float64(time.Second))
@@ -159,18 +242,39 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	return &sensorMonitor{
-		Named:        name.AsNamed(),
-		logger:       logger,
-		cfg:          conf,
-		sensorDep:    sensorDep,
-		notifierDep:  notifierDep,
-		pollInterval: pollInterval,
-		cooldown:     cooldown,
-		cancelCtx:    cancelCtx,
-		cancelFunc:   cancelFunc,
-		lastReadings: map[string]interface{}{},
-		ruleStates:   make([]ruleState, len(conf.Rules)),
+		Named:           name.AsNamed(),
+		logger:          logger,
+		cfg:             conf,
+		sensorDep:       sensorDep,
+		notifierDep:     notifierDep,
+		actionResources: actionResources,
+		pollInterval:    pollInterval,
+		cooldown:        cooldown,
+		cancelCtx:       cancelCtx,
+		cancelFunc:      cancelFunc,
+		lastReadings:    map[string]interface{}{},
+		ruleStates:      make([]ruleState, len(conf.Rules)),
 	}, nil
+}
+
+// lookupResource finds a dependency by its short name regardless of API, so an
+// action can target any resource type. Errors if no dependency — or more than
+// one — matches the name.
+func lookupResource(deps resource.Dependencies, shortName string) (resource.Resource, error) {
+	var found resource.Resource
+	for n, r := range deps {
+		if n.Name != shortName {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("matches multiple dependencies")
+		}
+		found = r
+	}
+	if found == nil {
+		return nil, fmt.Errorf("not found in dependencies")
+	}
+	return found, nil
 }
 
 // run is the background polling loop. It exits when the resource is closed.
@@ -225,6 +329,8 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 		fired := cmp(value, rule.Threshold)
 
 		notify := false
+		fireTrigger := false
+		fireResolve := false
 		m.mu.Lock()
 		st := &m.ruleStates[i]
 		st.lastValue = value
@@ -233,10 +339,13 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 			st.triggered = true
 			st.lastNotified = now
 			notify = true
+			fireTrigger = true
 		case fired && st.triggered && m.cooldown > 0 && now.Sub(st.lastNotified) >= m.cooldown:
 			st.lastNotified = now
 			notify = true
 		case !fired:
+			// Edge from triggered to cleared fires the resolve actions once.
+			fireResolve = st.triggered
 			st.triggered = false
 		}
 		m.mu.Unlock()
@@ -244,6 +353,30 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 		if notify {
 			m.sendNotification(ctx, rule, value)
 		}
+		if fireTrigger {
+			m.runActions(ctx, rule.OnTrigger)
+		}
+		if fireResolve {
+			m.runActions(ctx, rule.OnResolve)
+		}
+	}
+}
+
+// runActions fires each action's DoCommand on its resolved resource. Best-effort:
+// a failure is logged and never affects monitoring.
+func (m *sensorMonitor) runActions(ctx context.Context, actions []Action) {
+	for _, a := range actions {
+		res, ok := m.actionResources[a.Resource]
+		if !ok {
+			// Every action resource is resolved at construction, so this is unexpected.
+			m.logger.Warnf("action resource %q not resolved; skipping", a.Resource)
+			continue
+		}
+		if _, err := res.DoCommand(ctx, a.Command); err != nil {
+			m.logger.Warnf("action DoCommand on %q failed: %v", a.Resource, err)
+			continue
+		}
+		m.logger.Infof("action fired on %q", a.Resource)
 	}
 }
 

@@ -83,13 +83,52 @@ func (f *fakeNotifier) texts() []string {
 	return out
 }
 
+// fakeTarget is a generic resource standing in for an action target. It records
+// the DoCommands it receives so tests can assert what the monitor fired.
+type fakeTarget struct {
+	resource.Named
+	resource.AlwaysRebuild
+
+	mu       sync.Mutex
+	received []map[string]interface{}
+}
+
+func newFakeTarget(name string) *fakeTarget {
+	return &fakeTarget{Named: generic.Named(name).AsNamed()}
+}
+
+func (f *fakeTarget) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.received = append(f.received, cmd)
+	return map[string]interface{}{}, nil
+}
+
+func (f *fakeTarget) Close(context.Context) error { return nil }
+
+func (f *fakeTarget) commands() []map[string]interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]map[string]interface{}{}, f.received...)
+}
+
 // newTestMonitor builds a monitor wired to the given fakes WITHOUT starting the
 // background polling loop, so tests drive poll() deterministically.
 func newTestMonitor(t *testing.T, cfg *Config, src *fakeSensor, notifier *fakeNotifier) *sensorMonitor {
 	t.Helper()
+	return newTestMonitorWithTargets(t, cfg, src, notifier, nil)
+}
+
+// newTestMonitorWithTargets is newTestMonitor plus a set of action-target
+// resources, registered as generic dependencies under their names.
+func newTestMonitorWithTargets(t *testing.T, cfg *Config, src *fakeSensor, notifier *fakeNotifier, targets map[string]*fakeTarget) *sensorMonitor {
+	t.Helper()
 	deps := resource.Dependencies{
 		sensor.Named(cfg.Sensor):    src,
 		generic.Named(cfg.Notifier): notifier,
+	}
+	for name, tgt := range targets {
+		deps[generic.Named(name)] = tgt
 	}
 	name := resource.NewName(sensor.API, "monitor")
 	m, err := newMonitor(deps, name, cfg, logging.NewTestLogger(t))
@@ -135,6 +174,28 @@ func TestValidate(t *testing.T) {
 		{
 			name:    "rule bad operator",
 			cfg:     Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: "=>", Threshold: 1}}},
+			wantErr: true,
+		},
+		{
+			name: "with actions",
+			cfg: Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1,
+				OnTrigger: []Action{{Resource: "r1", Command: map[string]interface{}{"x": 1}}},
+				OnResolve: []Action{{Resource: "r2", Command: map[string]interface{}{"x": 0}}},
+			}}},
+			reqDeps: []string{"s", "n", "r1", "r2"},
+		},
+		{
+			name: "action missing resource",
+			cfg: Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1,
+				OnTrigger: []Action{{Command: map[string]interface{}{"x": 1}}},
+			}}},
+			wantErr: true,
+		},
+		{
+			name: "action missing command",
+			cfg: Config{Sensor: "s", Notifier: "n", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1,
+				OnResolve: []Action{{Resource: "r1"}},
+			}}},
 			wantErr: true,
 		},
 	}
@@ -322,5 +383,103 @@ func TestDoCommandCheckForcesPoll(t *testing.T) {
 
 	if _, err := m.DoCommand(ctx, map[string]interface{}{"bogus": 1}); err == nil {
 		t.Fatal("expected error for unknown command")
+	}
+}
+
+func TestActionsFireOnTriggerAndResolve(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	relay := newFakeTarget("relay")
+	m := newTestMonitorWithTargets(t, &Config{
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules: []Rule{{Key: "usage", Operator: ">=", Threshold: 15,
+			OnTrigger: []Action{{Resource: "relay", Command: map[string]interface{}{"set": true}}},
+			OnResolve: []Action{{Resource: "relay", Command: map[string]interface{}{"set": false}}},
+		}},
+	}, src, notifier, map[string]*fakeTarget{"relay": relay})
+
+	// Below threshold: nothing fired.
+	src.set(map[string]interface{}{"usage": 5.0})
+	m.poll(ctx)
+	if got := len(relay.commands()); got != 0 {
+		t.Fatalf("expected no actions below threshold, got %d", got)
+	}
+
+	// Cross above: the on_trigger action fires once.
+	src.set(map[string]interface{}{"usage": 20.0})
+	m.poll(ctx)
+	cmds := relay.commands()
+	if len(cmds) != 1 || cmds[0]["set"] != true {
+		t.Fatalf("expected one on_trigger command {set:true}, got %v", cmds)
+	}
+
+	// Still triggered: on_trigger does not refire.
+	m.poll(ctx)
+	if got := len(relay.commands()); got != 1 {
+		t.Fatalf("expected no refire while triggered, got %d", got)
+	}
+
+	// Reading returns below threshold: the on_resolve action fires once.
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx)
+	cmds = relay.commands()
+	if len(cmds) != 2 || cmds[1]["set"] != false {
+		t.Fatalf("expected on_resolve command {set:false}, got %v", cmds)
+	}
+
+	// Stays resolved: on_resolve does not refire.
+	m.poll(ctx)
+	if got := len(relay.commands()); got != 2 {
+		t.Fatalf("expected no refire while resolved, got %d", got)
+	}
+}
+
+func TestActionTargetsAnyResourceByName(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	// Two distinct targets, fired on different edges.
+	a := newFakeTarget("alpha")
+	b := newFakeTarget("beta")
+	m := newTestMonitorWithTargets(t, &Config{
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules: []Rule{{Key: "usage", Operator: ">=", Threshold: 15,
+			OnTrigger: []Action{{Resource: "alpha", Command: map[string]interface{}{"go": 1}}},
+			OnResolve: []Action{{Resource: "beta", Command: map[string]interface{}{"go": 2}}},
+		}},
+	}, src, notifier, map[string]*fakeTarget{"alpha": a, "beta": b})
+
+	src.set(map[string]interface{}{"usage": 20.0})
+	m.poll(ctx)
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx)
+
+	if cmds := a.commands(); len(cmds) != 1 || cmds[0]["go"] != 1 {
+		t.Fatalf("alpha (on_trigger) not fired correctly: %v", cmds)
+	}
+	if cmds := b.commands(); len(cmds) != 1 || cmds[0]["go"] != 2 {
+		t.Fatalf("beta (on_resolve) not fired correctly: %v", cmds)
+	}
+}
+
+func TestActionResourceMissingFromDeps(t *testing.T) {
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	deps := resource.Dependencies{
+		sensor.Named("src"):     src,
+		generic.Named("notify"): notifier,
+	}
+	cfg := &Config{
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules: []Rule{{Key: "usage", Operator: ">=", Threshold: 15,
+			OnTrigger: []Action{{Resource: "ghost", Command: map[string]interface{}{"x": 1}}},
+		}},
+	}
+	if _, err := newMonitor(deps, resource.NewName(sensor.API, "monitor"), cfg, logging.NewTestLogger(t)); err == nil {
+		t.Fatal("expected construction to fail when an action resource is not a dependency")
 	}
 }

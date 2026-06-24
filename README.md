@@ -79,6 +79,8 @@ When a rule fires, the monitor calls `DoCommand` on the notifier with the payloa
 
 Notifications are **edge-triggered**: a message is sent when a rule transitions from not-triggered to triggered. While the rule stays triggered no further message is sent, unless `cooldown_seconds` is set, in which case the message repeats at most once per cooldown window. When the reading clears the threshold and crosses it again, a new notification is sent.
 
+**Actions.** Besides notifying, a rule can fire arbitrary `DoCommand`s on other resources when it triggers and when it resolves, via the `on_trigger` and `on_resolve` lists. Each action names a `resource` (any component or service on the machine, by name) and a `command` (the `DoCommand` payload). Actions fire on the edges only — once when the rule transitions to triggered, once when it clears — not on `cooldown_seconds` repeats. Each named resource is automatically added as a dependency. Actions are best-effort: a failure is logged and never affects monitoring.
+
 ### Configuration
 
 ```json
@@ -92,7 +94,9 @@ Notifications are **edge-triggered**: a message is sent when a rule transitions 
       "key": "<string>",
       "operator": "<string>",
       "threshold": <number>,
-      "message": "<string>"
+      "message": "<string>",
+      "on_trigger": [{ "resource": "<string>", "command": { } }],
+      "on_resolve": [{ "resource": "<string>", "command": { } }]
     }
   ]
 }
@@ -114,6 +118,8 @@ Each entry in `rules`:
 | `operator`  | string | **Yes**  | Comparison applied between the reading and `threshold`. One of `>`, `>=`, `<`, `<=`, `==`, `!=` (aliases: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`).             |
 | `threshold` | number | **Yes**  | The value the reading is compared against.                                                                                                                   |
 | `message`   | string | No       | Notification template. Supports placeholders `{key}`, `{value}`, `{threshold}`, `{operator}`. If omitted, a message like `temperature is 95 (> 90)` is used. |
+| `on_trigger` | array  | No       | DoCommands to fire when the rule transitions to triggered. Each is `{ "resource": <name>, "command": <DoCommand payload> }`. |
+| `on_resolve` | array  | No       | DoCommands to fire when the rule clears (reading returns to the non-triggered side of the threshold). Same shape as `on_trigger`. |
 
 ### Example Configuration
 
@@ -128,7 +134,9 @@ Each entry in `rules`:
       "key": "temperature",
       "operator": ">",
       "threshold": 90,
-      "message": "High temperature alert: {key} is {value} (limit {threshold})"
+      "message": "High temperature alert: {key} is {value} (limit {threshold})",
+      "on_trigger": [{ "resource": "cooling-fan", "command": { "set": { "power": 1 } } }],
+      "on_resolve": [{ "resource": "cooling-fan", "command": { "set": { "power": 0 } } }]
     },
     {
       "key": "humidity",
