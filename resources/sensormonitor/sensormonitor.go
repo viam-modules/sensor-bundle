@@ -46,11 +46,10 @@ type Rule struct {
 	// Message is an optional notification template. It supports the placeholders
 	// {key}, {value}, {threshold} and {operator}. If empty, a message is generated.
 	Message string `json:"message,omitempty"`
-	// ResolveReaction is the emoji name (without colons, e.g. "white_check_mark")
-	// to add as a reaction to this rule's alert message when the rule clears (its
-	// reading returns to the non-triggered side of the threshold). When unset, no
-	// reaction is added. Requires the notifier to support a {"command": "react",
-	// ...} DoCommand and to have returned a message "ts" on send (the Slack
+	// ResolveReaction is the emoji name (e.g. "white_check_mark") to add as a
+	// reaction to this rule's alert message when the rule reading returns to
+	// the non-triggered side of the threshold. When unset, no reaction is added.
+	// Requires the notifier to support a {"command": "react", ...} DoCommand and to have returned a message "ts" on send (the Slack
 	// bot-token path).
 	ResolveReaction string `json:"resolve_reaction,omitempty"`
 }
@@ -99,12 +98,13 @@ type ruleState struct {
 	triggered    bool
 	lastNotified time.Time
 	lastValue    float64
-	// msgChannel and msgTS identify the most recent alert message sent for this
-	// rule, captured from the notifier's send response so the message can be
-	// reacted to when the rule clears. Empty when no alert is outstanding or the
-	// notifier did not return a ts (e.g. the Slack webhook path).
-	msgChannel string
-	msgTS      string
+	// sentMessage is the notifier's response to this rule's most recent alert
+	// send, retained opaquely and handed back to the notifier to react to that
+	// message when the rule clears. nil when no alert is outstanding. The monitor
+	// does not interpret its contents — they are notifier-specific (e.g. Slack
+	// returns a channel and message ts), which keeps the monitor decoupled from
+	// any particular notifier.
+	sentMessage map[string]interface{}
 }
 
 type sensorMonitor struct {
@@ -238,8 +238,7 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 		fired := cmp(value, rule.Threshold)
 
 		notify := false
-		resolved := false
-		var reactChannel, reactTS string
+		var reactTo map[string]interface{}
 		m.mu.Lock()
 		st := &m.ruleStates[i]
 		st.lastValue = value
@@ -253,43 +252,37 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 			notify = true
 		case !fired:
 			// Edge from triggered to cleared: the rule just resolved. When a resolve
-			// reaction is configured and we have a message to react to, capture it
-			// now and clear the stored identity so we react exactly once.
-			if st.triggered && st.msgTS != "" && rule.ResolveReaction != "" {
-				resolved = true
-				reactChannel = st.msgChannel
-				reactTS = st.msgTS
+			// reaction is configured and we captured the alert message, hand it back
+			// to react, then clear it so we react exactly once.
+			if st.triggered && st.sentMessage != nil && rule.ResolveReaction != "" {
+				reactTo = st.sentMessage
 			}
 			st.triggered = false
-			st.msgChannel = ""
-			st.msgTS = ""
+			st.sentMessage = nil
 		}
 		m.mu.Unlock()
 
 		if notify {
-			channel, ts := m.sendNotification(ctx, rule, value)
-			// Record the message so it can be reacted to on resolve. A re-notify
-			// (cooldown) overwrites the previous identity, so we react to the most
-			// recent alert. Empty ts (webhook path, or send failure) leaves nothing
-			// to react to.
-			if ts != "" {
+			resp := m.sendNotification(ctx, rule, value)
+			// Retain the notifier's response so the message can be reacted to on
+			// resolve. A re-notify (cooldown) overwrites it, so we react to the most
+			// recent alert. nil (send failure) leaves nothing to react to.
+			if resp != nil {
 				m.mu.Lock()
-				m.ruleStates[i].msgChannel = channel
-				m.ruleStates[i].msgTS = ts
+				m.ruleStates[i].sentMessage = resp
 				m.mu.Unlock()
 			}
 		}
-		if resolved {
-			m.sendResolveReaction(ctx, rule, reactChannel, reactTS)
+		if reactTo != nil {
+			m.sendResolveReaction(ctx, rule, reactTo)
 		}
 	}
 }
 
 // sendNotification renders the rule's message and calls DoCommand on the
-// notifier, returning the message's channel and ts when the notifier reports
-// them (the Slack bot-token path). Both are empty on failure or when the
-// notifier does not return them.
-func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) (channel, ts string) {
+// notifier, returning the notifier's response so the sent message can be reacted
+// to later. Returns nil on failure.
+func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) map[string]interface{} {
 	msg := renderMessage(rule, value)
 	cmd := map[string]interface{}{
 		"command": "send",
@@ -298,26 +291,26 @@ func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value f
 	resp, err := m.notifierDep.DoCommand(ctx, cmd)
 	if err != nil {
 		m.logger.Errorf("failed to notify via %q: %v", m.cfg.Notifier, err)
-		return "", ""
+		return nil
 	}
-	channel, _ = resp["channel"].(string)
-	ts, _ = resp["ts"].(string)
 	m.logger.Infof("notification sent: %s", msg)
-	return channel, ts
+	return resp
 }
 
 // sendResolveReaction asks the notifier to add the rule's resolve_reaction emoji
-// to a previously-sent alert message once the rule has cleared. Only called when
-// the rule's resolve_reaction is set. Best-effort: a failure (e.g. a notifier
-// that doesn't support "react", or a webhook notifier) is logged and never
-// affects monitoring.
-func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, channel, ts string) {
-	cmd := map[string]interface{}{
-		"command":   "react",
-		"name":      rule.ResolveReaction,
-		"channel":   channel,
-		"timestamp": ts,
+// to a previously-sent alert message once the rule has cleared. It hands the
+// notifier's own send response (sentMessage) back with the reaction name added,
+// so the monitor never has to know how the notifier identifies a message. Only
+// called when the rule's resolve_reaction is set. Best-effort: a failure (e.g. a
+// notifier that doesn't support "react", or one that can't react such as a Slack
+// webhook) is logged and never affects monitoring.
+func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, sentMessage map[string]interface{}) {
+	cmd := make(map[string]interface{}, len(sentMessage)+2)
+	for k, v := range sentMessage {
+		cmd[k] = v
 	}
+	cmd["command"] = "react"
+	cmd["name"] = rule.ResolveReaction
 	if _, err := m.notifierDep.DoCommand(ctx, cmd); err != nil {
 		m.logger.Warnf("failed to react to resolved alert for %q via %q: %v", rule.Key, m.cfg.Notifier, err)
 		return

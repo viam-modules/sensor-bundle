@@ -47,17 +47,19 @@ func (f *fakeSensor) Readings(ctx context.Context, extra map[string]interface{})
 func (f *fakeSensor) Close(context.Context) error { return nil }
 
 // fakeNotifier is a generic.Service that records the DoCommands it receives.
-// On a "send" it returns a synthetic ts/channel (the Slack bot-token shape) so
-// the monitor can capture a message identity to react to; an empty sendTS
-// simulates the webhook path that returns no ts.
+// On a "send" it returns a synthetic response (the Slack bot-token shape: ts +
+// channel) so the monitor can capture a message identity to react to. sendExtra
+// adds arbitrary opaque fields to that response, used to prove the monitor hands
+// the whole response back on react without interpreting it.
 type fakeNotifier struct {
 	resource.Named
 	resource.AlwaysRebuild
 
-	mu       sync.Mutex
-	received []map[string]interface{}
-	sendTS   string
-	sendCh   string
+	mu        sync.Mutex
+	received  []map[string]interface{}
+	sendTS    string
+	sendCh    string
+	sendExtra map[string]interface{}
 }
 
 func newFakeNotifier(name string) *fakeNotifier {
@@ -68,8 +70,18 @@ func (f *fakeNotifier) DoCommand(ctx context.Context, cmd map[string]interface{}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.received = append(f.received, cmd)
-	if cmd["command"] == "send" && f.sendTS != "" {
-		return map[string]interface{}{"ok": true, "ts": f.sendTS, "channel": f.sendCh}, nil
+	if cmd["command"] == "send" {
+		resp := map[string]interface{}{"ok": true}
+		if f.sendTS != "" {
+			resp["ts"] = f.sendTS
+		}
+		if f.sendCh != "" {
+			resp["channel"] = f.sendCh
+		}
+		for k, v := range f.sendExtra {
+			resp[k] = v
+		}
+		return resp, nil
 	}
 	return map[string]interface{}{"ok": true}, nil
 }
@@ -330,7 +342,7 @@ func TestReactsOnResolve(t *testing.T) {
 		t.Fatalf("expected 1 reaction on resolve, got %d: %v", len(reactions), reactions)
 	}
 	r := reactions[0]
-	if r["name"] != "white_check_mark" || r["timestamp"] != "100.1" || r["channel"] != "C0ALERTS" {
+	if r["name"] != "white_check_mark" || r["ts"] != "100.1" || r["channel"] != "C0ALERTS" {
 		t.Fatalf("reaction payload not as expected: %v", r)
 	}
 
@@ -341,11 +353,14 @@ func TestReactsOnResolve(t *testing.T) {
 	}
 }
 
-func TestNoReactionWithoutTS(t *testing.T) {
+// TestResolveReactionEchoesSendResponse proves the monitor hands the notifier's
+// entire send response back on react — including an opaque field it has no
+// knowledge of — rather than cherry-picking Slack-specific keys.
+func TestResolveReactionEchoesSendResponse(t *testing.T) {
 	ctx := context.Background()
 	src := newFakeSensor("src")
 	notifier := newFakeNotifier("notify")
-	notifier.sendTS = "" // simulate the webhook path: send returns no ts
+	notifier.sendExtra = map[string]interface{}{"thread_id": "T-9"} // a field the monitor knows nothing about
 	m := newTestMonitor(t, &Config{
 		Sensor:   "src",
 		Notifier: "notify",
@@ -357,8 +372,17 @@ func TestNoReactionWithoutTS(t *testing.T) {
 	src.set(map[string]interface{}{"usage": 0.0})
 	m.poll(ctx)
 
-	if got := len(notifier.reactions()); got != 0 {
-		t.Fatalf("expected no reaction when no ts was captured, got %d", got)
+	reactions := notifier.reactions()
+	if len(reactions) != 1 {
+		t.Fatalf("expected 1 reaction, got %d: %v", len(reactions), reactions)
+	}
+	r := reactions[0]
+	if r["command"] != "react" || r["name"] != "white_check_mark" {
+		t.Fatalf("react command/name not set: %v", r)
+	}
+	// The whole send response is forwarded verbatim, opaque field included.
+	if r["ts"] != "100.1" || r["channel"] != "C0ALERTS" || r["thread_id"] != "T-9" {
+		t.Fatalf("send response not echoed verbatim: %v", r)
 	}
 }
 
@@ -409,7 +433,7 @@ func TestReactsToLatestMessageAfterCooldownRenotify(t *testing.T) {
 	m.poll(ctx) // resolve: should react to the latest message
 
 	reactions := notifier.reactions()
-	if len(reactions) != 1 || reactions[0]["timestamp"] != "200.2" {
+	if len(reactions) != 1 || reactions[0]["ts"] != "200.2" {
 		t.Fatalf("expected reaction to latest ts 200.2, got %v", reactions)
 	}
 }
