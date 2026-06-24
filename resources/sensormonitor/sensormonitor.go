@@ -34,6 +34,14 @@ func init() {
 // defaultPollInterval is used when poll_interval_seconds is not set.
 const defaultPollInterval = 10 * time.Second
 
+// defaultResolveReaction is the emoji added to the original alert message when a
+// rule clears, unless resolve_reaction overrides it.
+const defaultResolveReaction = "white_check_mark"
+
+// reactionDisabled is the resolve_reaction sentinel that turns off reacting on
+// resolve.
+const reactionDisabled = "-"
+
 // Rule describes a single numeric trigger on one reading key.
 type Rule struct {
 	// Key is the reading key to watch, e.g. "temperature".
@@ -63,6 +71,13 @@ type Config struct {
 	// stays triggered, in seconds. 0 (default) means do not re-notify until the
 	// rule clears and fires again.
 	CooldownSec float64 `json:"cooldown_seconds,omitempty"`
+	// ResolveReaction is the emoji name (without colons) added as a reaction to
+	// the original alert message when a rule clears (value returns to the
+	// non-triggered side of the threshold). Requires the notifier to support a
+	// {"command": "react", ...} DoCommand and to have returned a message "ts" on
+	// send (the Slack bot-token path). Defaults to "white_check_mark". Set to
+	// "-" to disable reacting on resolve.
+	ResolveReaction string `json:"resolve_reaction,omitempty"`
 }
 
 // Validate checks the config and returns the required dependency names.
@@ -92,6 +107,12 @@ type ruleState struct {
 	triggered    bool
 	lastNotified time.Time
 	lastValue    float64
+	// msgChannel and msgTS identify the most recent alert message sent for this
+	// rule, captured from the notifier's send response so the message can be
+	// reacted to when the rule clears. Empty when no alert is outstanding or the
+	// notifier did not return a ts (e.g. the Slack webhook path).
+	msgChannel string
+	msgTS      string
 }
 
 type sensorMonitor struct {
@@ -104,8 +125,9 @@ type sensorMonitor struct {
 	sensorDep   sensor.Sensor
 	notifierDep generic.Service
 
-	pollInterval time.Duration
-	cooldown     time.Duration
+	pollInterval    time.Duration
+	cooldown        time.Duration
+	resolveReaction string
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -156,20 +178,26 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	}
 	cooldown := time.Duration(conf.CooldownSec * float64(time.Second))
 
+	resolveReaction := conf.ResolveReaction
+	if resolveReaction == "" {
+		resolveReaction = defaultResolveReaction
+	}
+
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	return &sensorMonitor{
-		Named:        name.AsNamed(),
-		logger:       logger,
-		cfg:          conf,
-		sensorDep:    sensorDep,
-		notifierDep:  notifierDep,
-		pollInterval: pollInterval,
-		cooldown:     cooldown,
-		cancelCtx:    cancelCtx,
-		cancelFunc:   cancelFunc,
-		lastReadings: map[string]interface{}{},
-		ruleStates:   make([]ruleState, len(conf.Rules)),
+		Named:           name.AsNamed(),
+		logger:          logger,
+		cfg:             conf,
+		sensorDep:       sensorDep,
+		notifierDep:     notifierDep,
+		pollInterval:    pollInterval,
+		cooldown:        cooldown,
+		resolveReaction: resolveReaction,
+		cancelCtx:       cancelCtx,
+		cancelFunc:      cancelFunc,
+		lastReadings:    map[string]interface{}{},
+		ruleStates:      make([]ruleState, len(conf.Rules)),
 	}, nil
 }
 
@@ -225,6 +253,8 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 		fired := cmp(value, rule.Threshold)
 
 		notify := false
+		resolved := false
+		var reactChannel, reactTS string
 		m.mu.Lock()
 		st := &m.ruleStates[i]
 		st.lastValue = value
@@ -237,28 +267,79 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 			st.lastNotified = now
 			notify = true
 		case !fired:
+			// Edge from triggered to cleared: the rule just resolved. If we have a
+			// message to react to, capture it now and clear the stored identity so
+			// we react exactly once.
+			if st.triggered && st.msgTS != "" {
+				resolved = true
+				reactChannel = st.msgChannel
+				reactTS = st.msgTS
+			}
 			st.triggered = false
+			st.msgChannel = ""
+			st.msgTS = ""
 		}
 		m.mu.Unlock()
 
 		if notify {
-			m.sendNotification(ctx, rule, value)
+			channel, ts := m.sendNotification(ctx, rule, value)
+			// Record the message so it can be reacted to on resolve. A re-notify
+			// (cooldown) overwrites the previous identity, so we react to the most
+			// recent alert. Empty ts (webhook path, or send failure) leaves nothing
+			// to react to.
+			if ts != "" {
+				m.mu.Lock()
+				m.ruleStates[i].msgChannel = channel
+				m.ruleStates[i].msgTS = ts
+				m.mu.Unlock()
+			}
+		}
+		if resolved {
+			m.sendResolveReaction(ctx, rule, reactChannel, reactTS)
 		}
 	}
 }
 
-// sendNotification renders the rule's message and calls DoCommand on the notifier.
-func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) {
+// sendNotification renders the rule's message and calls DoCommand on the
+// notifier, returning the message's channel and ts when the notifier reports
+// them (the Slack bot-token path). Both are empty on failure or when the
+// notifier does not return them.
+func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) (channel, ts string) {
 	msg := renderMessage(rule, value)
 	cmd := map[string]interface{}{
 		"command": "send",
 		"text":    msg,
 	}
-	if _, err := m.notifierDep.DoCommand(ctx, cmd); err != nil {
+	resp, err := m.notifierDep.DoCommand(ctx, cmd)
+	if err != nil {
 		m.logger.Errorf("failed to notify via %q: %v", m.cfg.Notifier, err)
+		return "", ""
+	}
+	channel, _ = resp["channel"].(string)
+	ts, _ = resp["ts"].(string)
+	m.logger.Infof("notification sent: %s", msg)
+	return channel, ts
+}
+
+// sendResolveReaction asks the notifier to add the configured emoji reaction to
+// a previously-sent alert message once its rule has cleared. Best-effort: a
+// failure (e.g. a notifier that doesn't support "react", or a webhook notifier)
+// is logged and never affects monitoring.
+func (m *sensorMonitor) sendResolveReaction(ctx context.Context, rule Rule, channel, ts string) {
+	if m.resolveReaction == reactionDisabled {
 		return
 	}
-	m.logger.Infof("notification sent: %s", msg)
+	cmd := map[string]interface{}{
+		"command":   "react",
+		"name":      m.resolveReaction,
+		"channel":   channel,
+		"timestamp": ts,
+	}
+	if _, err := m.notifierDep.DoCommand(ctx, cmd); err != nil {
+		m.logger.Warnf("failed to react to resolved alert for %q via %q: %v", rule.Key, m.cfg.Notifier, err)
+		return
+	}
+	m.logger.Infof("reacted :%s: to resolved alert for %q", m.resolveReaction, rule.Key)
 }
 
 // Readings returns the most recent sensor readings plus, per rule, a

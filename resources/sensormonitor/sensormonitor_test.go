@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
@@ -46,26 +47,47 @@ func (f *fakeSensor) Readings(ctx context.Context, extra map[string]interface{})
 func (f *fakeSensor) Close(context.Context) error { return nil }
 
 // fakeNotifier is a generic.Service that records the DoCommands it receives.
+// On a "send" it returns a synthetic ts/channel (the Slack bot-token shape) so
+// the monitor can capture a message identity to react to; an empty sendTS
+// simulates the webhook path that returns no ts.
 type fakeNotifier struct {
 	resource.Named
 	resource.AlwaysRebuild
 
 	mu       sync.Mutex
 	received []map[string]interface{}
+	sendTS   string
+	sendCh   string
 }
 
 func newFakeNotifier(name string) *fakeNotifier {
-	return &fakeNotifier{Named: generic.Named(name).AsNamed()}
+	return &fakeNotifier{Named: generic.Named(name).AsNamed(), sendTS: "100.1", sendCh: "C0ALERTS"}
 }
 
 func (f *fakeNotifier) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.received = append(f.received, cmd)
-	return map[string]interface{}{}, nil
+	if cmd["command"] == "send" && f.sendTS != "" {
+		return map[string]interface{}{"ok": true, "ts": f.sendTS, "channel": f.sendCh}, nil
+	}
+	return map[string]interface{}{"ok": true}, nil
 }
 
 func (f *fakeNotifier) Close(context.Context) error { return nil }
+
+// reactions returns the "react" DoCommands received so far.
+func (f *fakeNotifier) reactions() []map[string]interface{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]map[string]interface{}, 0)
+	for _, cmd := range f.received {
+		if cmd["command"] == "react" {
+			out = append(out, cmd)
+		}
+	}
+	return out
+}
 
 // texts returns the notification message strings received so far.
 func (f *fakeNotifier) texts() []string {
@@ -274,6 +296,118 @@ func TestEdgeTriggeredNotifies(t *testing.T) {
 	m.poll(ctx)
 	if got := len(notifier.texts()); got != 2 {
 		t.Fatalf("expected 2 notifications after re-fire, got %d", got)
+	}
+}
+
+func TestReactsOnResolve(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	m := newTestMonitor(t, &Config{
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+	}, src, notifier)
+
+	// Cross the threshold: one alert, captured ts, no reaction yet.
+	src.set(map[string]interface{}{"usage": 15.0})
+	m.poll(ctx)
+	if got := len(notifier.reactions()); got != 0 {
+		t.Fatalf("expected no reaction while triggered, got %d", got)
+	}
+
+	// Still triggered: no reaction.
+	m.poll(ctx)
+	if got := len(notifier.reactions()); got != 0 {
+		t.Fatalf("expected no reaction while still triggered, got %d", got)
+	}
+
+	// Counter reset below threshold (the streamdeck refill): react exactly once.
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx)
+	reactions := notifier.reactions()
+	if len(reactions) != 1 {
+		t.Fatalf("expected 1 reaction on resolve, got %d: %v", len(reactions), reactions)
+	}
+	r := reactions[0]
+	if r["name"] != defaultResolveReaction || r["timestamp"] != "100.1" || r["channel"] != "C0ALERTS" {
+		t.Fatalf("reaction payload not as expected: %v", r)
+	}
+
+	// Stays resolved: no further reactions (identity cleared).
+	m.poll(ctx)
+	if got := len(notifier.reactions()); got != 1 {
+		t.Fatalf("expected no repeat reaction, got %d", got)
+	}
+}
+
+func TestNoReactionWithoutTS(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	notifier.sendTS = "" // simulate the webhook path: send returns no ts
+	m := newTestMonitor(t, &Config{
+		Sensor:   "src",
+		Notifier: "notify",
+		Rules:    []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+	}, src, notifier)
+
+	src.set(map[string]interface{}{"usage": 20.0})
+	m.poll(ctx)
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx)
+
+	if got := len(notifier.reactions()); got != 0 {
+		t.Fatalf("expected no reaction when no ts was captured, got %d", got)
+	}
+}
+
+func TestResolveReactionDisabled(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	m := newTestMonitor(t, &Config{
+		Sensor:          "src",
+		Notifier:        "notify",
+		ResolveReaction: "-",
+		Rules:           []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+	}, src, notifier)
+
+	src.set(map[string]interface{}{"usage": 20.0})
+	m.poll(ctx)
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx)
+
+	if got := len(notifier.reactions()); got != 0 {
+		t.Fatalf("expected no reaction when disabled, got %d", got)
+	}
+}
+
+func TestReactsToLatestMessageAfterCooldownRenotify(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	notifier := newFakeNotifier("notify")
+	m := newTestMonitor(t, &Config{
+		Sensor:      "src",
+		Notifier:    "notify",
+		CooldownSec: 60, // long cooldown; we backdate lastNotified to force a re-notify
+		Rules:       []Rule{{Key: "usage", Operator: ">=", Threshold: 15}},
+	}, src, notifier)
+
+	src.set(map[string]interface{}{"usage": 20.0})
+	m.poll(ctx) // first alert: ts 100.1
+
+	// Backdate so the cooldown has deterministically elapsed, then re-notify.
+	m.ruleStates[0].lastNotified = m.ruleStates[0].lastNotified.Add(-time.Hour)
+	notifier.sendTS = "200.2" // a re-notify will return a new ts
+	m.poll(ctx)               // cooldown elapsed: re-notify, ts 200.2
+
+	src.set(map[string]interface{}{"usage": 0.0})
+	m.poll(ctx) // resolve: should react to the latest message
+
+	reactions := notifier.reactions()
+	if len(reactions) != 1 || reactions[0]["timestamp"] != "200.2" {
+		t.Fatalf("expected reaction to latest ts 200.2, got %v", reactions)
 	}
 }
 
