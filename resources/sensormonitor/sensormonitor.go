@@ -486,10 +486,7 @@ func toFloat64(v interface{}) (float64, bool) {
 }
 
 // refExact matches a string that is exactly one reference, e.g. "{{msg.ts}}".
-// refAny matches every reference embedded anywhere in a string. We use {{...}}
-// rather than ${...} because the Viam config reader reserves ${...} for its own
-// placeholder replacement and rejects unknown ones before the module sees the
-// config.
+// refAny matches every reference embedded anywhere in a string.
 var (
 	refExact = regexp.MustCompile(`^\{\{([^{}]+)\}\}$`)
 	refAny   = regexp.MustCompile(`\{\{([^{}]+)\}\}`)

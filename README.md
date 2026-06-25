@@ -82,8 +82,6 @@ Monitors the readings of another sensor and, when a numeric reading crosses a co
 - Rule/reading context: `{{value}}` (the current reading), `{{key}}`, `{{threshold}}`, `{{operator}}`.
 - Captured responses: set `"capture": "<name>"` on an action to store its `DoCommand` response, then reference its fields from later actions (including `on_resolve`) as `{{<name>.<field>}}`.
 
-`{{...}}` is used rather than `${...}` because the Viam config reader reserves `${...}` for its own placeholder replacement and would reject these references before the module sees the config.
-
 A value that is exactly one reference keeps the referenced value's type; a reference embedded in a larger string is substituted as text. If a reference can't be resolved (e.g. nothing was captured), that action is skipped. A capture is overwritten on each cooldown re-fire (so resolve references the most recent response) and cleared once the rule resolves.
 
 ### Configuration
