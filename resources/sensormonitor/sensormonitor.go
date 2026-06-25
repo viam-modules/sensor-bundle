@@ -1,12 +1,14 @@
 // Package sensormonitor implements the viam:sensor-bundle:sensor-monitor model: a
 // sensor that watches another sensor's readings against numeric trigger rules and
-// sends a notification via a generic service's DoCommand when a threshold is crossed.
+// fires configurable DoCommand actions on other resources when a rule triggers or
+// resolves.
 package sensormonitor
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,12 +17,11 @@ import (
 	sensor "go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	generic "go.viam.com/rdk/services/generic"
 )
 
 // Model is the sensor-monitor model triplet. It watches the readings of a sensor
-// and fires notifications through a generic service when a numeric reading crosses
-// a configured threshold.
+// and fires DoCommand actions on other resources when a numeric reading crosses a
+// configured threshold.
 var Model = resource.NewModel("viam", "sensor-bundle", "sensor-monitor")
 
 func init() {
@@ -34,6 +35,18 @@ func init() {
 // defaultPollInterval is used when poll_interval_seconds is not set.
 const defaultPollInterval = 10 * time.Second
 
+// Action is a DoCommand to fire on a resource when a rule changes state.
+type Action struct {
+	// Resource is the name of the resource to call.
+	Resource string `json:"resource"`
+	// Command is the DoCommand payload. String values may contain ${...}
+	// references that are resolved before the command is sent — see resolveValue.
+	Command map[string]interface{} `json:"command"`
+	// Capture, when set, stores this action's response under this name so later
+	// actions can reference its fields as ${name.field}.
+	Capture string `json:"capture,omitempty"`
+}
+
 // Rule describes a single numeric trigger on one reading key.
 type Rule struct {
 	// Key is the reading key to watch, e.g. "temperature".
@@ -43,25 +56,24 @@ type Rule struct {
 	Operator string `json:"operator"`
 	// Threshold is the value the reading is compared against.
 	Threshold float64 `json:"threshold"`
-	// Message is an optional notification template. It supports the placeholders
-	// {key}, {value}, {threshold} and {operator}. If empty, a message is generated.
-	Message string `json:"message,omitempty"`
+	// OnTrigger lists actions to fire when the rule transitions to triggered, and
+	// again on each cooldown window while it stays triggered.
+	OnTrigger []Action `json:"on_trigger,omitempty"`
+	// OnResolve lists actions to fire when the rule clears (its reading returns to
+	// the non-triggered side of the threshold).
+	OnResolve []Action `json:"on_resolve,omitempty"`
 }
 
 // Config is the configuration for the sensor-monitor model.
 type Config struct {
 	// Sensor is the name of the sensor dependency whose readings are monitored.
 	Sensor string `json:"sensor"`
-	// Notifier is the name of the generic service dependency that receives
-	// notification DoCommands of the form {"command": "send", "text": <message>}.
-	Notifier string `json:"notifier"`
 	// Rules is the set of numeric trigger rules. At least one is required.
 	Rules []Rule `json:"rules"`
 	// PollIntervalSec is how often the sensor is polled, in seconds. Defaults to 10.
 	PollIntervalSec float64 `json:"poll_interval_seconds,omitempty"`
-	// CooldownSec is the minimum time between repeat notifications while a rule
-	// stays triggered, in seconds. 0 (default) means do not re-notify until the
-	// rule clears and fires again.
+	// CooldownSec is the minimum time between repeat on_trigger firings while a
+	// rule stays triggered, in seconds. 0 (default) means fire only on the edge.
 	CooldownSec float64 `json:"cooldown_seconds,omitempty"`
 }
 
@@ -70,12 +82,19 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.Sensor == "" {
 		return nil, nil, fmt.Errorf("%s: missing required field 'sensor'", path)
 	}
-	if cfg.Notifier == "" {
-		return nil, nil, fmt.Errorf("%s: missing required field 'notifier'", path)
-	}
 	if len(cfg.Rules) == 0 {
 		return nil, nil, fmt.Errorf("%s: at least one rule is required", path)
 	}
+
+	deps := []string{cfg.Sensor}
+	seen := map[string]bool{cfg.Sensor: true}
+	addDep := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			deps = append(deps, name)
+		}
+	}
+
 	for i, r := range cfg.Rules {
 		if r.Key == "" {
 			return nil, nil, fmt.Errorf("%s: rules[%d] missing required field 'key'", path, i)
@@ -83,15 +102,41 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		if _, err := parseOperator(r.Operator); err != nil {
 			return nil, nil, fmt.Errorf("%s: rules[%d] %w", path, i, err)
 		}
+		for j, a := range r.OnTrigger {
+			if err := validateAction(a); err != nil {
+				return nil, nil, fmt.Errorf("%s: rules[%d].on_trigger[%d] %w", path, i, j, err)
+			}
+			addDep(a.Resource)
+		}
+		for j, a := range r.OnResolve {
+			if err := validateAction(a); err != nil {
+				return nil, nil, fmt.Errorf("%s: rules[%d].on_resolve[%d] %w", path, i, j, err)
+			}
+			addDep(a.Resource)
+		}
 	}
-	return []string{cfg.Sensor, cfg.Notifier}, nil, nil
+	return deps, nil, nil
+}
+
+// validateAction checks a single action's required fields.
+func validateAction(a Action) error {
+	if a.Resource == "" {
+		return fmt.Errorf("missing required field 'resource'")
+	}
+	if a.Command == nil {
+		return fmt.Errorf("missing required field 'command'")
+	}
+	return nil
 }
 
 // ruleState tracks the runtime state of a single rule across polls.
 type ruleState struct {
-	triggered    bool
-	lastNotified time.Time
-	lastValue    float64
+	triggered bool
+	lastFired time.Time
+	lastValue float64
+	// vars holds the responses of actions that set "capture", keyed by capture
+	// name, so later actions can reference values produced. Reset when the rule resolves.
+	vars map[string]interface{}
 }
 
 type sensorMonitor struct {
@@ -101,8 +146,10 @@ type sensorMonitor struct {
 	logger logging.Logger
 	cfg    *Config
 
-	sensorDep   sensor.Sensor
-	notifierDep generic.Service
+	sensorDep sensor.Sensor
+	// actionResources holds every resource named by a rule action, resolved once
+	// at construction and keyed by name.
+	actionResources map[string]resource.Resource
 
 	pollInterval time.Duration
 	cooldown     time.Duration
@@ -145,9 +192,31 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	if err != nil {
 		return nil, fmt.Errorf("failed to get sensor dependency %q: %w", conf.Sensor, err)
 	}
-	notifierDep, err := generic.FromProvider(deps, conf.Notifier)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get notifier dependency %q: %w", conf.Notifier, err)
+
+	// Resolve every resource named by an action up front so firing is a simple map lookup + DoCommand.
+	actionResources := map[string]resource.Resource{}
+	resolveAction := func(a Action) error {
+		if _, ok := actionResources[a.Resource]; ok {
+			return nil
+		}
+		res, err := lookupResource(deps, a.Resource)
+		if err != nil {
+			return fmt.Errorf("action resource %q: %w", a.Resource, err)
+		}
+		actionResources[a.Resource] = res
+		return nil
+	}
+	for _, r := range conf.Rules {
+		for _, a := range r.OnTrigger {
+			if err := resolveAction(a); err != nil {
+				return nil, err
+			}
+		}
+		for _, a := range r.OnResolve {
+			if err := resolveAction(a); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	pollInterval := defaultPollInterval
@@ -159,18 +228,38 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	return &sensorMonitor{
-		Named:        name.AsNamed(),
-		logger:       logger,
-		cfg:          conf,
-		sensorDep:    sensorDep,
-		notifierDep:  notifierDep,
-		pollInterval: pollInterval,
-		cooldown:     cooldown,
-		cancelCtx:    cancelCtx,
-		cancelFunc:   cancelFunc,
-		lastReadings: map[string]interface{}{},
-		ruleStates:   make([]ruleState, len(conf.Rules)),
+		Named:           name.AsNamed(),
+		logger:          logger,
+		cfg:             conf,
+		sensorDep:       sensorDep,
+		actionResources: actionResources,
+		pollInterval:    pollInterval,
+		cooldown:        cooldown,
+		cancelCtx:       cancelCtx,
+		cancelFunc:      cancelFunc,
+		lastReadings:    map[string]interface{}{},
+		ruleStates:      make([]ruleState, len(conf.Rules)),
 	}, nil
+}
+
+// lookupResource finds a dependency by its short name regardless of API, so an
+// action can target any resource type. Errors if no dependency — or more than
+// one — matches the name.
+func lookupResource(deps resource.Dependencies, shortName string) (resource.Resource, error) {
+	var found resource.Resource
+	for n, r := range deps {
+		if n.Name != shortName {
+			continue
+		}
+		if found != nil {
+			return nil, fmt.Errorf("matches multiple dependencies")
+		}
+		found = r
+	}
+	if found == nil {
+		return nil, fmt.Errorf("not found in dependencies")
+	}
+	return found, nil
 }
 
 // run is the background polling loop. It exits when the resource is closed.
@@ -193,7 +282,7 @@ func (m *sensorMonitor) run() {
 	}
 }
 
-// poll reads the sensor once, evaluates every rule, and sends notifications.
+// poll reads the sensor once, evaluates every rule, and fires the rule's actions.
 func (m *sensorMonitor) poll(ctx context.Context) {
 	readings, err := m.sensorDep.Readings(ctx, nil)
 	if err != nil {
@@ -224,41 +313,101 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 		cmp, _ := parseOperator(rule.Operator)
 		fired := cmp(value, rule.Threshold)
 
-		notify := false
+		fireTrigger := false
+		fireResolve := false
 		m.mu.Lock()
 		st := &m.ruleStates[i]
 		st.lastValue = value
 		switch {
 		case fired && !st.triggered:
 			st.triggered = true
-			st.lastNotified = now
-			notify = true
-		case fired && st.triggered && m.cooldown > 0 && now.Sub(st.lastNotified) >= m.cooldown:
-			st.lastNotified = now
-			notify = true
+			st.lastFired = now
+			fireTrigger = true
+		case fired && st.triggered && m.cooldown > 0 && now.Sub(st.lastFired) >= m.cooldown:
+			st.lastFired = now
+			fireTrigger = true
 		case !fired:
+			fireResolve = st.triggered
 			st.triggered = false
 		}
 		m.mu.Unlock()
 
-		if notify {
-			m.sendNotification(ctx, rule, value)
+		if fireTrigger {
+			m.runActions(ctx, i, rule, rule.OnTrigger, value)
+		}
+		if fireResolve {
+			m.runActions(ctx, i, rule, rule.OnResolve, value)
+			// The episode is over; drop captured vars so the next one starts fresh.
+			m.mu.Lock()
+			m.ruleStates[i].vars = nil
+			m.mu.Unlock()
 		}
 	}
 }
 
-// sendNotification renders the rule's message and calls DoCommand on the notifier.
-func (m *sensorMonitor) sendNotification(ctx context.Context, rule Rule, value float64) {
-	msg := renderMessage(rule, value)
-	cmd := map[string]interface{}{
-		"command": "send",
-		"text":    msg,
-	}
-	if _, err := m.notifierDep.DoCommand(ctx, cmd); err != nil {
-		m.logger.Errorf("failed to notify via %q: %v", m.cfg.Notifier, err)
+// runActions fires each action's DoCommand on its resolved resource. Before each
+// call it resolves ${...} references in the command against the rule/reading
+// context and any captured responses; after a successful call it stores the
+// response under the action's capture name (if set) for later actions to
+// reference. Best-effort: an unresolved reference, missing resource, or DoCommand
+// error logs a warning and skips that action without affecting monitoring.
+func (m *sensorMonitor) runActions(ctx context.Context, ruleIdx int, rule Rule, actions []Action, value float64) {
+	if len(actions) == 0 {
 		return
 	}
-	m.logger.Infof("notification sent: %s", msg)
+
+	// Substitution context: the rule/reading values plus any previously captured
+	// responses for this rule.
+	subCtx := map[string]interface{}{
+		"value":     value,
+		"key":       rule.Key,
+		"threshold": rule.Threshold,
+		"operator":  rule.Operator,
+	}
+	m.mu.RLock()
+	for k, v := range m.ruleStates[ruleIdx].vars {
+		subCtx[k] = v
+	}
+	m.mu.RUnlock()
+
+	captured := map[string]interface{}{}
+	for _, a := range actions {
+		res, ok := m.actionResources[a.Resource]
+		if !ok {
+			// Every action resource is resolved at construction, so this is unexpected.
+			m.logger.Warnf("action resource %q not resolved; skipping", a.Resource)
+			continue
+		}
+		resolved, err := resolveValue(a.Command, subCtx)
+		if err != nil {
+			m.logger.Warnf("skipping action on %q: %v", a.Resource, err)
+			continue
+		}
+		cmd, _ := resolved.(map[string]interface{})
+		resp, err := res.DoCommand(ctx, cmd)
+		if err != nil {
+			m.logger.Warnf("action DoCommand on %q failed: %v", a.Resource, err)
+			continue
+		}
+		if a.Capture != "" {
+			// Available to later actions in this batch and (after the loop) persisted
+			// for on_resolve.
+			subCtx[a.Capture] = resp
+			captured[a.Capture] = resp
+		}
+		m.logger.Infof("action fired on %q", a.Resource)
+	}
+
+	if len(captured) > 0 {
+		m.mu.Lock()
+		if m.ruleStates[ruleIdx].vars == nil {
+			m.ruleStates[ruleIdx].vars = map[string]interface{}{}
+		}
+		for k, v := range captured {
+			m.ruleStates[ruleIdx].vars[k] = v
+		}
+		m.mu.Unlock()
+	}
 }
 
 // Readings returns the most recent sensor readings plus, per rule, a
@@ -336,26 +485,88 @@ func toFloat64(v interface{}) (float64, bool) {
 	}
 }
 
-// renderMessage builds the notification text for a fired rule.
-func renderMessage(rule Rule, value float64) string {
-	if rule.Message == "" {
-		return fmt.Sprintf("%s is %s (%s %s)",
-			rule.Key,
-			formatFloat(value),
-			rule.Operator,
-			formatFloat(rule.Threshold),
-		)
+// refExact matches a string that is exactly one reference, e.g. "${msg.ts}".
+// refAny matches every reference embedded anywhere in a string.
+var (
+	refExact = regexp.MustCompile(`^\$\{([^}]+)\}$`)
+	refAny   = regexp.MustCompile(`\$\{([^}]+)\}`)
+)
+
+// resolveValue walks a command value and substitutes ${name} / ${name.path}
+// references against ctx. A value that is exactly one reference keeps the
+// referenced value's type (so a captured map or number passes through intact); a
+// reference embedded in a larger string is substituted textually. An unresolved
+// reference returns an error so the caller can skip the action.
+func resolveValue(v interface{}, ctx map[string]interface{}) (interface{}, error) {
+	switch x := v.(type) {
+	case string:
+		if mm := refExact.FindStringSubmatch(x); mm != nil {
+			val, ok := lookupPath(ctx, mm[1])
+			if !ok {
+				return nil, fmt.Errorf("unresolved reference ${%s}", mm[1])
+			}
+			return val, nil
+		}
+		var refErr error
+		out := refAny.ReplaceAllStringFunc(x, func(match string) string {
+			path := refAny.FindStringSubmatch(match)[1]
+			val, ok := lookupPath(ctx, path)
+			if !ok {
+				refErr = fmt.Errorf("unresolved reference ${%s}", path)
+				return match
+			}
+			return stringify(val)
+		})
+		if refErr != nil {
+			return nil, refErr
+		}
+		return out, nil
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(x))
+		for k, val := range x {
+			rv, err := resolveValue(val, ctx)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = rv
+		}
+		return out, nil
+	case []interface{}:
+		out := make([]interface{}, len(x))
+		for i, e := range x {
+			rv, err := resolveValue(e, ctx)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = rv
+		}
+		return out, nil
+	default:
+		return v, nil
 	}
-	r := strings.NewReplacer(
-		"{key}", rule.Key,
-		"{value}", formatFloat(value),
-		"{threshold}", formatFloat(rule.Threshold),
-		"{operator}", rule.Operator,
-	)
-	return r.Replace(rule.Message)
 }
 
-// formatFloat renders a float without a trailing ".0" for whole numbers.
-func formatFloat(f float64) string {
-	return strconv.FormatFloat(f, 'f', -1, 64)
+// lookupPath walks a dot-separated path into a context map.
+func lookupPath(ctx map[string]interface{}, path string) (interface{}, bool) {
+	var cur interface{} = ctx
+	for _, part := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		cur, ok = m[part]
+		if !ok {
+			return nil, false
+		}
+	}
+	return cur, true
+}
+
+// stringify renders a referenced value for embedding in a larger string,
+// trimming trailing zeros from floats.
+func stringify(v interface{}) string {
+	if f, ok := v.(float64); ok {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	return fmt.Sprint(v)
 }
