@@ -39,11 +39,11 @@ const defaultPollInterval = 10 * time.Second
 type Action struct {
 	// Resource is the name of the resource to call.
 	Resource string `json:"resource"`
-	// Command is the DoCommand payload. String values may contain ${...}
+	// Command is the DoCommand payload. String values may contain {{...}}
 	// references that are resolved before the command is sent — see resolveValue.
 	Command map[string]interface{} `json:"command"`
 	// Capture, when set, stores this action's response under this name so later
-	// actions can reference its fields as ${name.field}.
+	// actions can reference its fields as {{name.field}}.
 	Capture string `json:"capture,omitempty"`
 }
 
@@ -485,14 +485,14 @@ func toFloat64(v interface{}) (float64, bool) {
 	}
 }
 
-// refExact matches a string that is exactly one reference, e.g. "${msg.ts}".
+// refExact matches a string that is exactly one reference, e.g. "{{msg.ts}}".
 // refAny matches every reference embedded anywhere in a string.
 var (
-	refExact = regexp.MustCompile(`^\$\{([^}]+)\}$`)
-	refAny   = regexp.MustCompile(`\$\{([^}]+)\}`)
+	refExact = regexp.MustCompile(`^\{\{([^{}]+)\}\}$`)
+	refAny   = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
 )
 
-// resolveValue walks a command value and substitutes ${name} / ${name.path}
+// resolveValue walks a command value and substitutes {{name}} / {{name.path}}
 // references against ctx. A value that is exactly one reference keeps the
 // referenced value's type (so a captured map or number passes through intact); a
 // reference embedded in a larger string is substituted textually. An unresolved
@@ -501,18 +501,19 @@ func resolveValue(v interface{}, ctx map[string]interface{}) (interface{}, error
 	switch x := v.(type) {
 	case string:
 		if mm := refExact.FindStringSubmatch(x); mm != nil {
-			val, ok := lookupPath(ctx, mm[1])
+			path := strings.TrimSpace(mm[1])
+			val, ok := lookupPath(ctx, path)
 			if !ok {
-				return nil, fmt.Errorf("unresolved reference ${%s}", mm[1])
+				return nil, fmt.Errorf("unresolved reference {{%s}}", path)
 			}
 			return val, nil
 		}
 		var refErr error
 		out := refAny.ReplaceAllStringFunc(x, func(match string) string {
-			path := refAny.FindStringSubmatch(match)[1]
+			path := strings.TrimSpace(refAny.FindStringSubmatch(match)[1])
 			val, ok := lookupPath(ctx, path)
 			if !ok {
-				refErr = fmt.Errorf("unresolved reference ${%s}", path)
+				refErr = fmt.Errorf("unresolved reference {{%s}}", path)
 				return match
 			}
 			return stringify(val)

@@ -77,10 +77,10 @@ Monitors the readings of another sensor and, when a numeric reading crosses a co
 - `on_resolve` fires once when the reading clears the threshold.
 - Actions are best-effort: a failure is logged and never affects monitoring. Each named resource is automatically added as a dependency.
 
-**References and captures.** String values in a `command` may embed `${...}` references, resolved just before the command is sent:
+**References and captures.** String values in a `command` may embed `{{...}}` references, resolved just before the command is sent:
 
-- Rule/reading context: `${value}` (the current reading), `${key}`, `${threshold}`, `${operator}`.
-- Captured responses: set `"capture": "<name>"` on an action to store its `DoCommand` response, then reference its fields from later actions (including `on_resolve`) as `${<name>.<field>}`.
+- Rule/reading context: `{{value}}` (the current reading), `{{key}}`, `{{threshold}}`, `{{operator}}`.
+- Captured responses: set `"capture": "<name>"` on an action to store its `DoCommand` response, then reference its fields from later actions (including `on_resolve`) as `{{<name>.<field>}}`.
 
 A value that is exactly one reference keeps the referenced value's type; a reference embedded in a larger string is substituted as text. If a reference can't be resolved (e.g. nothing was captured), that action is skipped. A capture is overwritten on each cooldown re-fire (so resolve references the most recent response) and cleared once the rule resolves.
 
@@ -137,14 +137,14 @@ A low-bean alert that posts to Slack on trigger and adds a ✅ reaction to that 
       "on_trigger": [
         {
           "resource": "slack-notifier",
-          "command": { "command": "send", "text": "☕ Regular beans are low (${value}), please refill." },
+          "command": { "command": "send", "text": "☕ Regular beans are low ({{value}}), please refill." },
           "capture": "msg"
         }
       ],
       "on_resolve": [
         {
           "resource": "slack-notifier",
-          "command": { "command": "react", "name": "white_check_mark", "ts": "${msg.ts}", "channel": "${msg.channel}" }
+          "command": { "command": "react", "name": "white_check_mark", "ts": "{{msg.ts}}", "channel": "{{msg.channel}}" }
         }
       ]
     },

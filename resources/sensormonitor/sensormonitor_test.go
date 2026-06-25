@@ -248,7 +248,7 @@ func TestResolveValue(t *testing.T) {
 	}
 
 	t.Run("exact reference keeps type", func(t *testing.T) {
-		got, err := resolveValue("${value}", ctx)
+		got, err := resolveValue("{{value}}", ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -258,7 +258,7 @@ func TestResolveValue(t *testing.T) {
 	})
 
 	t.Run("exact reference into capture", func(t *testing.T) {
-		got, err := resolveValue("${msg.ts}", ctx)
+		got, err := resolveValue("{{msg.ts}}", ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -268,7 +268,7 @@ func TestResolveValue(t *testing.T) {
 	})
 
 	t.Run("embedded references are stringified", func(t *testing.T) {
-		got, err := resolveValue("temp ${value} over ${threshold}", ctx)
+		got, err := resolveValue("temp {{value}} over {{threshold}}", ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -279,8 +279,8 @@ func TestResolveValue(t *testing.T) {
 
 	t.Run("recurses into maps and slices", func(t *testing.T) {
 		got, err := resolveValue(map[string]interface{}{
-			"a": "${value}",
-			"b": []interface{}{"${key}"},
+			"a": "{{value}}",
+			"b": []interface{}{"{{key}}"},
 		}, ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -295,7 +295,7 @@ func TestResolveValue(t *testing.T) {
 	})
 
 	t.Run("unresolved reference errors", func(t *testing.T) {
-		if _, err := resolveValue("${nope.field}", ctx); err == nil {
+		if _, err := resolveValue("{{nope.field}}", ctx); err == nil {
 			t.Fatal("expected error for unresolved reference")
 		}
 	})
@@ -387,14 +387,14 @@ func TestCaptureCarriesAcrossTriggerAndResolve(t *testing.T) {
 		Rules: []Rule{{Key: "usage", Operator: ">=", Threshold: 15,
 			OnTrigger: []Action{{
 				Resource: "notifier",
-				Command:  map[string]interface{}{"command": "send", "text": "low (${value})"},
+				Command:  map[string]interface{}{"command": "send", "text": "low ({{value}})"},
 				Capture:  "msg",
 			}},
 			OnResolve: []Action{{
 				Resource: "notifier",
 				Command: map[string]interface{}{
 					"command": "react", "name": "white_check_mark",
-					"ts": "${msg.ts}", "channel": "${msg.channel}",
+					"ts": "{{msg.ts}}", "channel": "{{msg.channel}}",
 				},
 			}},
 		}},
@@ -428,7 +428,7 @@ func TestResolveActionSkippedWhenCaptureMissing(t *testing.T) {
 		Sensor: "src",
 		Rules: []Rule{{Key: "usage", Operator: ">=", Threshold: 15,
 			OnTrigger: []Action{{Resource: "notifier", Command: map[string]interface{}{"command": "send"}}},
-			OnResolve: []Action{{Resource: "notifier", Command: map[string]interface{}{"command": "react", "ts": "${msg.ts}"}}},
+			OnResolve: []Action{{Resource: "notifier", Command: map[string]interface{}{"command": "react", "ts": "{{msg.ts}}"}}},
 		}},
 	}, src, map[string]*fakeTarget{"notifier": notifier})
 
