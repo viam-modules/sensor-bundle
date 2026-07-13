@@ -114,6 +114,7 @@ Each entry in `rules`:
 
 | Name        | Type   | Required | Description                                                                                                                                                  |
 | ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`      | string | No       | Identifies the rule so it can be targeted by the `snooze` DoCommand. When set, must be unique across rules. Only named rules can be snoozed.                  |
 | `key`       | string | **Yes**  | The reading key to watch, e.g. `"temperature"`. Non-numeric or missing values are skipped.                                                                   |
 | `operator`  | string | **Yes**  | Comparison applied between the reading and `threshold`. One of `>`, `>=`, `<`, `<=`, `==`, `!=` (aliases: `gt`, `gte`, `lt`, `lte`, `eq`, `ne`).             |
 | `threshold` | number | **Yes**  | The value the reading is compared against.                                                                                                                   |
@@ -149,6 +150,7 @@ A low-bean alert that posts to Slack on trigger and adds a ✅ reaction to that 
       ]
     },
     {
+      "name": "too-hot",
       "key": "temperature",
       "operator": ">",
       "threshold": 90,
@@ -161,14 +163,16 @@ A low-bean alert that posts to Slack on trigger and adds a ✅ reaction to that 
 
 ### Readings
 
-Returns the most recent readings from the monitored sensor, plus a `<key>_triggered` boolean for each rule indicating whether it is currently firing.
+Returns the most recent readings from the monitored sensor, plus per rule a `<key>_triggered` boolean indicating whether it is currently firing and a `<key>_snoozed` boolean indicating whether its evaluation is currently suppressed (see the `snooze` DoCommand).
 
 ```json
 {
   "temperature": 95.0,
   "humidity": 35.0,
   "temperature_triggered": true,
-  "humidity_triggered": false
+  "temperature_snoozed": false,
+  "humidity_triggered": false,
+  "humidity_snoozed": false
 }
 ```
 
@@ -185,3 +189,17 @@ Returns:
 ```json
 {"check": "ok"}
 ```
+
+**`snooze`** - Suppress evaluation of a single named rule for a duration. While a rule is snoozed the sensor keeps polling and its `Readings` stay current, but that rule is not evaluated and its actions do not fire (other rules are unaffected). A condition still breaching when the snooze ends fires on the next poll. `rule_name` must match a rule's `name`; `duration` is a string with a unit of seconds (`s`), minutes (`m`), hours (`h`), or days (`d`), e.g. `30s`, `90m`, `24h`, `5d`.
+
+```json
+{"snooze": {"rule_name": "too-hot", "duration": "30m"}}
+```
+
+Returns the rule and the time the snooze expires (RFC 3339):
+
+```json
+{"rule_name": "too-hot", "snoozed_until": "2026-07-11T15:52:04-04:00"}
+```
+
+The current snooze state is also exposed in `Readings` as a `<key>_snoozed` boolean per rule.

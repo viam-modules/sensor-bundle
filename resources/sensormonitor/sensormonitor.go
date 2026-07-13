@@ -49,6 +49,9 @@ type Action struct {
 
 // Rule describes a single numeric trigger on one reading key.
 type Rule struct {
+	// Name optionally identifies the rule so it can be targeted by the "snooze"
+	// DoCommand. Names, when set, must be unique across rules.
+	Name string `json:"name,omitempty"`
 	// Key is the reading key to watch, e.g. "temperature".
 	Key string `json:"key"`
 	// Operator is the comparison to apply between the reading value and Threshold.
@@ -95,9 +98,16 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		}
 	}
 
+	seenNames := map[string]bool{}
 	for i, r := range cfg.Rules {
 		if r.Key == "" {
 			return nil, nil, fmt.Errorf("%s: rules[%d] missing required field 'key'", path, i)
+		}
+		if r.Name != "" {
+			if seenNames[r.Name] {
+				return nil, nil, fmt.Errorf("%s: rules[%d] duplicate rule name %q", path, i, r.Name)
+			}
+			seenNames[r.Name] = true
 		}
 		if _, err := parseOperator(r.Operator); err != nil {
 			return nil, nil, fmt.Errorf("%s: rules[%d] %w", path, i, err)
@@ -134,6 +144,9 @@ type ruleState struct {
 	triggered bool
 	lastFired time.Time
 	lastValue float64
+	// snoozeUntil suppresses evaluation of this rule until this time. The zero value
+	// means not snoozed.
+	snoozeUntil time.Time
 	// vars holds the responses of actions that set "capture", keyed by capture
 	// name, so later actions can reference values produced. Reset when the rule resolves.
 	vars map[string]interface{}
@@ -298,6 +311,16 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 	for i := range m.cfg.Rules {
 		rule := m.cfg.Rules[i]
 
+		// Skip snoozed rules. Readings stay current (updated above) but the rule is
+		// not evaluated, so no actions fire and its state is frozen — a condition
+		// still breaching when the snooze ends fires on the next poll.
+		m.mu.RLock()
+		snoozed := now.Before(m.ruleStates[i].snoozeUntil)
+		m.mu.RUnlock()
+		if snoozed {
+			continue
+		}
+
 		raw, ok := readings[rule.Key]
 		if !ok {
 			m.logger.Debugf("reading key %q not present; skipping rule %d", rule.Key, i)
@@ -411,22 +434,30 @@ func (m *sensorMonitor) runActions(ctx context.Context, ruleIdx int, rule Rule, 
 }
 
 // Readings returns the most recent sensor readings plus, per rule, a
-// "<key>_triggered" boolean indicating whether the rule is currently firing.
+// "<key>_triggered" boolean indicating whether the rule is currently firing and a
+// "<key>_snoozed" boolean indicating whether the rule's evaluation is currently
+// suppressed by a snooze.
 func (m *sensorMonitor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	out := make(map[string]interface{}, len(m.lastReadings)+len(m.cfg.Rules))
+	now := time.Now()
+	out := make(map[string]interface{}, len(m.lastReadings)+2*len(m.cfg.Rules))
 	for k, v := range m.lastReadings {
 		out[k] = v
 	}
 	for i := range m.cfg.Rules {
 		out[m.cfg.Rules[i].Key+"_triggered"] = m.ruleStates[i].triggered
+		out[m.cfg.Rules[i].Key+"_snoozed"] = now.Before(m.ruleStates[i].snoozeUntil)
 	}
 	return out, nil
 }
 
-// DoCommand supports {"check": true} to force an immediate poll.
+// DoCommand supports:
+//   - {"check": true} to force an immediate poll.
+//   - {"snooze": {"rule_name": <name>, "duration": <duration>}} to suppress
+//     evaluation of the named rule for the given duration, e.g. "30s", "90m",
+//     "24h", "5d". Returns {"rule_name": <name>, "snoozed_until": <RFC3339 time>}.
 func (m *sensorMonitor) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if check, ok := cmd["check"]; ok {
 		if b, ok := check.(bool); ok && b {
@@ -434,7 +465,49 @@ func (m *sensorMonitor) DoCommand(ctx context.Context, cmd map[string]interface{
 			return map[string]interface{}{"check": "ok"}, nil
 		}
 	}
-	return nil, fmt.Errorf("unsupported command: expected {%q: true}", "check")
+	if raw, ok := cmd["snooze"]; ok {
+		return m.snooze(raw)
+	}
+	return nil, fmt.Errorf("unsupported command: expected {%q: true} or {%q: {...}}", "check", "snooze")
+}
+
+// snooze handles the "snooze" DoCommand, suppressing evaluation of a single named
+// rule for a duration. The payload is {"rule_name": <name>, "duration": <duration>}.
+func (m *sensorMonitor) snooze(raw interface{}) (map[string]interface{}, error) {
+	args, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("snooze: expected an object {\"rule_name\": <string>, \"duration\": <string>}, got %T", raw)
+	}
+	ruleName, ok := args["rule_name"].(string)
+	if !ok || ruleName == "" {
+		return nil, fmt.Errorf("snooze: missing or invalid \"rule_name\" (want a non-empty string)")
+	}
+	durStr, ok := args["duration"].(string)
+	if !ok {
+		return nil, fmt.Errorf("snooze: missing or invalid \"duration\" (want a string like \"30s\", \"90m\", \"24h\", \"5d\")")
+	}
+	d, err := parseSnoozeDuration(durStr)
+	if err != nil {
+		return nil, fmt.Errorf("snooze: %w", err)
+	}
+
+	idx := -1
+	for i := range m.cfg.Rules {
+		if m.cfg.Rules[i].Name == ruleName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("snooze: no rule named %q", ruleName)
+	}
+
+	until := time.Now().Add(d)
+	m.mu.Lock()
+	m.ruleStates[idx].snoozeUntil = until
+	m.mu.Unlock()
+	m.logger.Infof("snoozing rule %q until %s", ruleName, until.Format(time.RFC3339))
+	return map[string]interface{}{"rule_name": ruleName, "snoozed_until": until.Format(time.RFC3339)}, nil
 }
 
 func (m *sensorMonitor) Close(context.Context) error {
@@ -462,6 +535,36 @@ func parseOperator(op string) (func(a, b float64) bool, error) {
 	default:
 		return nil, fmt.Errorf("unknown operator %q", op)
 	}
+}
+
+// snoozeDurationRe matches a duration like "30s", "90m", "24h", or "5d": a
+// non-negative number followed by a unit of seconds, minutes, hours, or days.
+var snoozeDurationRe = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([smhd])$`)
+
+// parseSnoozeDuration parses a snooze duration string. Unlike time.ParseDuration
+// it accepts a "d" (day) unit — and only the units s, m, h, d — matching the
+// coarse granularity a snooze needs, e.g. "30s", "90m", "24h", "5d".
+func parseSnoozeDuration(s string) (time.Duration, error) {
+	mm := snoozeDurationRe.FindStringSubmatch(strings.ToLower(strings.TrimSpace(s)))
+	if mm == nil {
+		return 0, fmt.Errorf("invalid duration %q: want a number followed by s, m, h, or d (e.g. \"30s\", \"90m\", \"24h\", \"5d\")", s)
+	}
+	n, err := strconv.ParseFloat(mm[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	var unit time.Duration
+	switch mm[2] {
+	case "s":
+		unit = time.Second
+	case "m":
+		unit = time.Minute
+	case "h":
+		unit = time.Hour
+	case "d":
+		unit = 24 * time.Hour
+	}
+	return time.Duration(n * float64(unit)), nil
 }
 
 // toFloat64 coerces a JSON-decoded reading value to a float64.

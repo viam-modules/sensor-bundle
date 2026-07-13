@@ -141,6 +141,14 @@ func TestValidate(t *testing.T) {
 			reqDeps: []string{"s", "r1", "r2"},
 		},
 		{
+			name: "duplicate rule names",
+			cfg: Config{Sensor: "s", Rules: []Rule{
+				{Name: "dup", Key: "t", Operator: ">", Threshold: 1},
+				{Name: "dup", Key: "h", Operator: "<", Threshold: 2},
+			}},
+			wantErr: true,
+		},
+		{
 			name: "action missing resource",
 			cfg: Config{Sensor: "s", Rules: []Rule{{Key: "t", Operator: ">", Threshold: 1,
 				OnTrigger: []Action{{Command: map[string]interface{}{"x": 1}}},
@@ -212,6 +220,44 @@ func TestParseOperator(t *testing.T) {
 			}
 			if got := cmp(tt.a, tt.b); got != tt.want {
 				t.Fatalf("%v %s %v = %v, want %v", tt.a, tt.op, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSnoozeDuration(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{in: "30s", want: 30 * time.Second},
+		{in: "90m", want: 90 * time.Minute},
+		{in: "24h", want: 24 * time.Hour},
+		{in: "5d", want: 5 * 24 * time.Hour},
+		{in: "1.5h", want: 90 * time.Minute},
+		{in: " 5D ", want: 5 * 24 * time.Hour}, // trimmed and case-insensitive
+		{in: "0s", want: 0},
+		{in: "", wantErr: true},
+		{in: "5", wantErr: true},   // missing unit
+		{in: "5w", wantErr: true},  // unsupported unit
+		{in: "-5s", wantErr: true}, // negative
+		{in: "abc", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got, err := parseSnoozeDuration(tt.in)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseSnoozeDuration(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
 	}
@@ -501,5 +547,100 @@ func TestDoCommandCheckForcesPoll(t *testing.T) {
 
 	if _, err := m.DoCommand(ctx, map[string]interface{}{"bogus": 1}); err == nil {
 		t.Fatal("expected error for unknown command")
+	}
+}
+
+func TestDoCommandSnoozeSuppressesRule(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	src.set(map[string]interface{}{"temperature": 95.0, "humidity": 20.0})
+	hot := newFakeTarget("hot")
+	dry := newFakeTarget("dry")
+	// Two rules; snoozing one must not affect the other.
+	m := newTestMonitor(t, &Config{
+		Sensor: "src",
+		Rules: []Rule{
+			{Name: "too-hot", Key: "temperature", Operator: ">", Threshold: 90,
+				OnTrigger: []Action{{Resource: "hot", Command: map[string]interface{}{"go": 1}}}},
+			{Name: "too-dry", Key: "humidity", Operator: "<", Threshold: 30,
+				OnTrigger: []Action{{Resource: "dry", Command: map[string]interface{}{"go": 1}}}},
+		},
+	}, src, map[string]*fakeTarget{"hot": hot, "dry": dry})
+
+	// Snooze only the temperature rule.
+	resp, err := m.DoCommand(ctx, map[string]interface{}{"snooze": map[string]interface{}{
+		"rule_name": "too-hot", "duration": "1h",
+	}})
+	if err != nil {
+		t.Fatalf("DoCommand snooze: %v", err)
+	}
+	if resp["rule_name"] != "too-hot" {
+		t.Fatalf("expected rule_name in response, got %v", resp)
+	}
+	if _, ok := resp["snoozed_until"].(string); !ok {
+		t.Fatalf("expected snoozed_until in response, got %v", resp)
+	}
+
+	// Poll while both are breaching: the snoozed rule stays silent, the other fires.
+	m.poll(ctx)
+	if got := len(hot.commands()); got != 0 {
+		t.Fatalf("expected no actions from snoozed rule, got %d", got)
+	}
+	if got := len(dry.commands()); got != 1 {
+		t.Fatalf("expected the un-snoozed rule to fire, got %d", got)
+	}
+
+	// Readings report the snooze per rule while readings stay current.
+	got, err := m.Readings(ctx, nil)
+	if err != nil {
+		t.Fatalf("Readings: %v", err)
+	}
+	if snoozed, _ := got["temperature_snoozed"].(bool); !snoozed {
+		t.Fatalf("expected temperature_snoozed=true, got %v", got["temperature_snoozed"])
+	}
+	if snoozed, _ := got["humidity_snoozed"].(bool); snoozed {
+		t.Fatalf("expected humidity_snoozed=false, got %v", got["humidity_snoozed"])
+	}
+	if got["temperature"] != 95.0 {
+		t.Fatalf("expected readings to stay current while snoozed, got %v", got["temperature"])
+	}
+
+	// Backdate the snooze so it has expired; the still-breaching rule now fires.
+	m.mu.Lock()
+	m.ruleStates[0].snoozeUntil = m.ruleStates[0].snoozeUntil.Add(-2 * time.Hour)
+	m.mu.Unlock()
+	m.poll(ctx)
+	if got := len(hot.commands()); got != 1 {
+		t.Fatalf("expected one action after snooze expired, got %d", got)
+	}
+	got, _ = m.Readings(ctx, nil)
+	if snoozed, _ := got["temperature_snoozed"].(bool); snoozed {
+		t.Fatalf("expected temperature_snoozed=false after expiry, got %v", got["temperature_snoozed"])
+	}
+}
+
+func TestDoCommandSnoozeInvalid(t *testing.T) {
+	ctx := context.Background()
+	src := newFakeSensor("src")
+	m := newTestMonitor(t, &Config{
+		Sensor: "src",
+		Rules:  []Rule{{Name: "too-hot", Key: "temperature", Operator: ">", Threshold: 90}},
+	}, src, nil)
+
+	cases := map[string]interface{}{
+		"non-object payload":  "1h",
+		"missing rule_name":   map[string]interface{}{"duration": "1h"},
+		"empty rule_name":     map[string]interface{}{"rule_name": "", "duration": "1h"},
+		"unknown rule_name":   map[string]interface{}{"rule_name": "ghost", "duration": "1h"},
+		"missing duration":    map[string]interface{}{"rule_name": "too-hot"},
+		"non-string duration": map[string]interface{}{"rule_name": "too-hot", "duration": 30},
+		"invalid duration":    map[string]interface{}{"rule_name": "too-hot", "duration": "5w"},
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := m.DoCommand(ctx, map[string]interface{}{"snooze": payload}); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
 	}
 }
