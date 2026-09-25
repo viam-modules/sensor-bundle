@@ -65,6 +65,12 @@ type Rule struct {
 	// OnResolve lists actions to fire when the rule clears (its reading returns to
 	// the non-triggered side of the threshold).
 	OnResolve []Action `json:"on_resolve,omitempty"`
+	// SnoozeWindows are recurring windows during which this rule is not evaluated,
+	// in addition to the monitor-wide Config.SnoozeWindows.
+	SnoozeWindows []TimeWindow `json:"snooze_windows,omitempty"`
+	// ActiveWindows, when set, restrict this rule to being evaluated only inside
+	// one of these windows. They narrow, never widen, Config.ActiveWindows.
+	ActiveWindows []TimeWindow `json:"active_windows,omitempty"`
 }
 
 // Config is the configuration for the sensor-monitor model.
@@ -78,6 +84,15 @@ type Config struct {
 	// CooldownSec is the minimum time between repeat on_trigger firings while a
 	// rule stays triggered, in seconds. 0 (default) means fire only on the edge.
 	CooldownSec float64 `json:"cooldown_seconds,omitempty"`
+	// SnoozeWindows are recurring windows during which no rule is evaluated, e.g.
+	// a nightly maintenance slot. They take precedence over ActiveWindows.
+	SnoozeWindows []TimeWindow `json:"snooze_windows,omitempty"`
+	// ActiveWindows, when set, restrict every rule to being evaluated only inside
+	// one of these windows, e.g. business hours.
+	ActiveWindows []TimeWindow `json:"active_windows,omitempty"`
+	// Timezone is the IANA time zone (e.g. "America/New_York") snooze and active
+	// windows are interpreted in. Defaults to the machine's local time zone.
+	Timezone string `json:"timezone,omitempty"`
 }
 
 // Validate checks the config and returns the required dependency names.
@@ -87,6 +102,12 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	}
 	if len(cfg.Rules) == 0 {
 		return nil, nil, fmt.Errorf("%s: at least one rule is required", path)
+	}
+	if _, err := loadLocation(cfg.Timezone); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if _, err := buildSchedules(cfg); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
 
 	deps := []string{cfg.Sensor}
@@ -167,6 +188,12 @@ type sensorMonitor struct {
 	pollInterval time.Duration
 	cooldown     time.Duration
 
+	// loc is the time zone windows are evaluated in. schedules[i] gates rule i.
+	loc       *time.Location
+	schedules []schedule
+	// now returns the current time; overridden in tests.
+	now func() time.Time
+
 	cancelCtx  context.Context
 	cancelFunc func()
 	wg         sync.WaitGroup
@@ -238,6 +265,15 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 	}
 	cooldown := time.Duration(conf.CooldownSec * float64(time.Second))
 
+	loc, err := loadLocation(conf.Timezone)
+	if err != nil {
+		return nil, err
+	}
+	schedules, err := buildSchedules(conf)
+	if err != nil {
+		return nil, err
+	}
+
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	return &sensorMonitor{
@@ -248,6 +284,9 @@ func newMonitor(deps resource.Dependencies, name resource.Name, conf *Config, lo
 		actionResources: actionResources,
 		pollInterval:    pollInterval,
 		cooldown:        cooldown,
+		loc:             loc,
+		schedules:       schedules,
+		now:             time.Now,
 		cancelCtx:       cancelCtx,
 		cancelFunc:      cancelFunc,
 		lastReadings:    map[string]interface{}{},
@@ -307,15 +346,16 @@ func (m *sensorMonitor) poll(ctx context.Context) {
 	m.lastReadings = readings
 	m.mu.Unlock()
 
-	now := time.Now()
+	now := m.now()
 	for i := range m.cfg.Rules {
 		rule := m.cfg.Rules[i]
 
-		// Skip snoozed rules. Readings stay current (updated above) but the rule is
-		// not evaluated, so no actions fire and its state is frozen — a condition
-		// still breaching when the snooze ends fires on the next poll.
+		// Skip snoozed rules (by DoCommand or time window). Readings stay current
+		// (updated above) but the rule is not evaluated, so no actions fire and its
+		// state is frozen — a condition still breaching when the snooze ends fires
+		// on the next poll.
 		m.mu.RLock()
-		snoozed := now.Before(m.ruleStates[i].snoozeUntil)
+		snoozed := m.isSnoozed(i, now)
 		m.mu.RUnlock()
 		if snoozed {
 			continue
@@ -433,22 +473,28 @@ func (m *sensorMonitor) runActions(ctx context.Context, ruleIdx int, rule Rule, 
 	}
 }
 
+// isSnoozed reports whether rule i is suppressed at now, either by a "snooze"
+// DoCommand or by its snooze/active windows. Callers must hold m.mu.
+func (m *sensorMonitor) isSnoozed(i int, now time.Time) bool {
+	return now.Before(m.ruleStates[i].snoozeUntil) || m.schedules[i].muted(now.In(m.loc))
+}
+
 // Readings returns the most recent sensor readings plus, per rule, a
 // "<key>_triggered" boolean indicating whether the rule is currently firing and a
 // "<key>_snoozed" boolean indicating whether the rule's evaluation is currently
-// suppressed by a snooze.
+// suppressed by a snooze DoCommand or its snooze/active windows.
 func (m *sensorMonitor) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	now := time.Now()
+	now := m.now()
 	out := make(map[string]interface{}, len(m.lastReadings)+2*len(m.cfg.Rules))
 	for k, v := range m.lastReadings {
 		out[k] = v
 	}
 	for i := range m.cfg.Rules {
 		out[m.cfg.Rules[i].Key+"_triggered"] = m.ruleStates[i].triggered
-		out[m.cfg.Rules[i].Key+"_snoozed"] = now.Before(m.ruleStates[i].snoozeUntil)
+		out[m.cfg.Rules[i].Key+"_snoozed"] = m.isSnoozed(i, now)
 	}
 	return out, nil
 }
@@ -502,7 +548,7 @@ func (m *sensorMonitor) snooze(raw interface{}) (map[string]interface{}, error) 
 		return nil, fmt.Errorf("snooze: no rule named %q", ruleName)
 	}
 
-	until := time.Now().Add(d)
+	until := m.now().Add(d)
 	m.mu.Lock()
 	m.ruleStates[idx].snoozeUntil = until
 	m.mu.Unlock()
