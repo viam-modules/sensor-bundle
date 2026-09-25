@@ -91,13 +91,16 @@ A value that is exactly one reference keeps the referenced value's type; a refer
   "sensor": "<string>",
   "poll_interval_seconds": <number>,
   "cooldown_seconds": <number>,
+  "timezone": "<string>",
+  "snooze_windows": [{ "days": ["<string>"], "start": "HH:MM", "end": "HH:MM" }],
   "rules": [
     {
       "key": "<string>",
       "operator": "<string>",
       "threshold": <number>,
       "on_trigger": [{ "resource": "<string>", "command": { }, "capture": "<string>" }],
-      "on_resolve": [{ "resource": "<string>", "command": { } }]
+      "on_resolve": [{ "resource": "<string>", "command": { } }],
+      "snooze_windows": [{ "days": ["<string>"], "start": "HH:MM", "end": "HH:MM" }]
     }
   ]
 }
@@ -109,6 +112,8 @@ A value that is exactly one reference keeps the referenced value's type; a refer
 | `rules`                 | array  | **Yes**  | One or more numeric trigger rules (see below). At least one rule is required.                                                                                |
 | `poll_interval_seconds` | number | No       | How often the sensor is polled, in seconds. Defaults to `10`.                                                                                                |
 | `cooldown_seconds`      | number | No       | Minimum time between repeat `on_trigger` firings while a rule stays triggered. `0` (default) means fire only on the edge.                                     |
+| `snooze_windows`        | array  | No       | Recurring weekly windows during which **no** rule is evaluated, e.g. outside business hours. See [Snooze windows](#snooze-windows).                          |
+| `timezone`              | string | No       | IANA time zone that snooze windows are interpreted in, e.g. `"America/New_York"`. Defaults to the machine's local time zone.                                  |
 
 Each entry in `rules`:
 
@@ -120,6 +125,34 @@ Each entry in `rules`:
 | `threshold` | number | **Yes**  | The value the reading is compared against.                                                                                                                   |
 | `on_trigger` | array  | No       | Actions to fire when the rule triggers (and on each cooldown window). Each is `{ "resource": <name>, "command": <DoCommand payload>, "capture": <name?> }`. |
 | `on_resolve` | array  | No       | Actions to fire when the rule clears. Same shape as `on_trigger`.                                                                                            |
+| `snooze_windows` | array | No     | Recurring windows during which this rule is not evaluated, in addition to the monitor-level `snooze_windows`.                                                |
+
+### Snooze windows
+
+A snooze window mutes rules on a recurring weekly schedule. It has the same effect as the [`snooze` DoCommand](#docommand): readings keep updating, but the rule is not evaluated and none of its actions fire. A condition that is still breaching when the window closes fires on the next poll. A rule that was already triggered when the window opened keeps that state, so its `on_resolve` fires once the window closes if the reading has cleared by then.
+
+Each window:
+
+| Name    | Type     | Required | Description                                                                                                                   |
+| ------- | -------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `days`  | string[] | No       | Days the window starts on: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun` (full names also accepted). Defaults to every day. |
+| `start` | string   | No       | Time the window opens, `"HH:MM"` (24-hour). Defaults to `"00:00"`.                                                            |
+| `end`   | string   | No       | Time the window closes (exclusive), `"HH:MM"`. Defaults to `"24:00"` (end of day).                                            |
+
+Leave out both `start` and `end` to mute the whole day. If `end` is earlier than `start`, the window runs past midnight: `{"days": ["fri"], "start": "22:00", "end": "06:00"}` covers Friday 22:00 to Saturday 06:00.
+
+To alert **only during business hours** (Mon–Fri 09:00–17:00):
+
+```json
+{
+  "timezone": "America/New_York",
+  "snooze_windows": [
+    { "days": ["mon", "tue", "wed", "thu", "fri"], "end": "09:00" },
+    { "days": ["mon", "tue", "wed", "thu", "fri"], "start": "17:00" },
+    { "days": ["sat", "sun"] }
+  ]
+}
+```
 
 ### Example Configuration
 
@@ -163,7 +196,7 @@ A low-bean alert that posts to Slack on trigger and adds a ✅ reaction to that 
 
 ### Readings
 
-Returns the most recent readings from the monitored sensor, plus per rule a `<key>_triggered` boolean indicating whether it is currently firing and a `<key>_snoozed` boolean indicating whether its evaluation is currently suppressed (see the `snooze` DoCommand).
+Returns the most recent readings from the monitored sensor, plus per rule a `<key>_triggered` boolean indicating whether it is currently firing and a `<key>_snoozed` boolean indicating whether its evaluation is currently suppressed, either by the `snooze` DoCommand or by a snooze window.
 
 ```json
 {
