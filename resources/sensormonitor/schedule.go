@@ -11,11 +11,12 @@ import (
 	_ "time/tzdata"
 )
 
-// SnoozeWindow is a recurring weekly time window during which rules are not
-// evaluated, e.g. outside business hours.
-type SnoozeWindow struct {
-	// Days lists the days of the week the window starts on ("mon".."sun" or full
-	// names, case-insensitive). Empty means every day.
+// TimeWindow is a recurring weekly time window, used both for snooze windows
+// (rules are muted inside) and active windows (rules are muted outside).
+type TimeWindow struct {
+	// Days lists the days of the week the window starts on: single days
+	// ("mon".."sun" or full names, case-insensitive) or inclusive ranges such as
+	// "mon-fri" (ranges may wrap, e.g. "fri-mon"). Empty means every day.
 	Days []string `json:"days,omitempty"`
 	// Start is the local wall-clock time the window opens, as "HH:MM". Defaults to
 	// "00:00".
@@ -28,7 +29,7 @@ type SnoozeWindow struct {
 
 const minutesPerDay = 24 * 60
 
-// window is a parsed SnoozeWindow. start and end are minutes since midnight.
+// window is a parsed TimeWindow. start and end are minutes since midnight.
 type window struct {
 	days       [7]bool // indexed by time.Weekday
 	start, end int
@@ -57,39 +58,97 @@ func inAnyWindow(windows []window, t time.Time) bool {
 	return false
 }
 
-// parseWindows parses a list of snooze windows.
-func parseWindows(ws []SnoozeWindow) ([]window, error) {
-	out := make([]window, 0, len(ws))
-	for i, sw := range ws {
-		w, err := parseWindow(sw)
+// schedule is the set of time windows that gate one rule.
+type schedule struct {
+	// snooze holds the monitor-wide and rule snooze windows; being inside any
+	// of them mutes the rule.
+	snooze []window
+	// active holds one group per level (monitor, rule) that sets active_windows.
+	// The rule is muted unless the time is inside some window of every group, so
+	// a rule's active windows can only narrow the monitor's.
+	active [][]window
+}
+
+// muted reports whether the schedule suppresses the rule at t, already in the
+// monitor's time zone.
+func (s schedule) muted(t time.Time) bool {
+	if inAnyWindow(s.snooze, t) {
+		return true
+	}
+	for _, group := range s.active {
+		if !inAnyWindow(group, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildSchedules parses every window in the config and returns one schedule per
+// rule, in rule order.
+func buildSchedules(cfg *Config) ([]schedule, error) {
+	globalSnooze, err := parseWindows("snooze_windows", cfg.SnoozeWindows)
+	if err != nil {
+		return nil, err
+	}
+	globalActive, err := parseWindows("active_windows", cfg.ActiveWindows)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]schedule, len(cfg.Rules))
+	for i, r := range cfg.Rules {
+		snooze, err := parseWindows("snooze_windows", r.SnoozeWindows)
 		if err != nil {
-			return nil, fmt.Errorf("snooze_windows[%d]: %w", i, err)
+			return nil, fmt.Errorf("rules[%d].%w", i, err)
+		}
+		active, err := parseWindows("active_windows", r.ActiveWindows)
+		if err != nil {
+			return nil, fmt.Errorf("rules[%d].%w", i, err)
+		}
+
+		s := schedule{snooze: append(append([]window{}, globalSnooze...), snooze...)}
+		if len(globalActive) > 0 {
+			s.active = append(s.active, globalActive)
+		}
+		if len(active) > 0 {
+			s.active = append(s.active, active)
+		}
+		out[i] = s
+	}
+	return out, nil
+}
+
+// parseWindows parses a list of windows; field names the list in errors.
+func parseWindows(field string, ws []TimeWindow) ([]window, error) {
+	out := make([]window, 0, len(ws))
+	for i, tw := range ws {
+		w, err := parseWindow(tw)
+		if err != nil {
+			return nil, fmt.Errorf("%s[%d]: %w", field, i, err)
 		}
 		out = append(out, w)
 	}
 	return out, nil
 }
 
-func parseWindow(sw SnoozeWindow) (window, error) {
+func parseWindow(tw TimeWindow) (window, error) {
 	var w window
-	if len(sw.Days) == 0 {
+	if len(tw.Days) == 0 {
 		for i := range w.days {
 			w.days[i] = true
 		}
 	}
-	for _, d := range sw.Days {
-		wd, err := parseWeekday(d)
-		if err != nil {
+	for _, d := range tw.Days {
+		if err := addDays(&w.days, d); err != nil {
 			return window{}, err
 		}
-		w.days[wd] = true
 	}
 
 	var err error
-	if w.start, err = parseClock(sw.Start, 0); err != nil {
+	if w.start, err = parseClock(tw.Start, 0); err != nil {
 		return window{}, fmt.Errorf("start: %w", err)
 	}
-	if w.end, err = parseClock(sw.End, minutesPerDay); err != nil {
+	if w.end, err = parseClock(tw.End, minutesPerDay); err != nil {
 		return window{}, fmt.Errorf("end: %w", err)
 	}
 	if w.start == minutesPerDay {
@@ -99,6 +158,28 @@ func parseWindow(sw SnoozeWindow) (window, error) {
 		return window{}, fmt.Errorf("start and end must differ (omit both for a whole-day window)")
 	}
 	return w, nil
+}
+
+// addDays marks the day or inclusive day range s (e.g. "mon", "mon-fri",
+// "fri-mon") in days.
+func addDays(days *[7]bool, s string) error {
+	from, to, isRange := strings.Cut(s, "-")
+	first, err := parseWeekday(from)
+	if err != nil {
+		return err
+	}
+	last := first
+	if isRange {
+		if last, err = parseWeekday(to); err != nil {
+			return err
+		}
+	}
+	for d := first; ; d = (d + 1) % 7 {
+		days[d] = true
+		if d == last {
+			return nil
+		}
+	}
 }
 
 // parseClock parses "HH:MM" into minutes since midnight. "24:00" is accepted to
@@ -133,7 +214,7 @@ var weekdays = map[string]time.Weekday{
 func parseWeekday(s string) (time.Weekday, error) {
 	wd, ok := weekdays[strings.ToLower(strings.TrimSpace(s))]
 	if !ok {
-		return 0, fmt.Errorf("invalid day %q: want mon, tue, wed, thu, fri, sat, or sun", s)
+		return 0, fmt.Errorf("invalid day %q: want mon, tue, wed, thu, fri, sat, or sun, or a range like \"mon-fri\"", s)
 	}
 	return wd, nil
 }
