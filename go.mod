@@ -2,7 +2,7 @@ module sensorbundle
 
 go 1.26.10
 
-require go.viam.com/rdk v1.14.0
+require go.viam.com/rdk v1.15.0
 
 require (
 	cel.dev/expr v0.25.2 // indirect
@@ -74,7 +74,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fullstorydev/grpcurl v1.8.6 // indirect
 	github.com/go-gl/mathgl v1.0.0 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
@@ -184,7 +184,7 @@ require (
 	go.uber.org/goleak v1.3.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	go.viam.com/api v0.1.602 // indirect
+	go.viam.com/api v0.1.603 // indirect
 	go.viam.com/test v1.2.5 // indirect
 	go.viam.com/utils v0.16.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
